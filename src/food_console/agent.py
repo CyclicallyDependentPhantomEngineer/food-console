@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -167,7 +168,7 @@ class OrderAgent:
 
     async def _run_tool(self, block) -> dict[str, Any]:
         tool = self.mcp.tools.get(block.name)
-        args = block.input if isinstance(block.input, dict) else {}
+        args = copy.deepcopy(block.input) if isinstance(block.input, dict) else {}
         result: dict[str, Any] = {"type": "tool_result", "tool_use_id": block.id}
 
         if tool is None or (self.tool_filter is not None and not self.tool_filter(tool)):
@@ -175,19 +176,27 @@ class OrderAgent:
         if self.arg_guard is not None and (refusal := self.arg_guard(tool, args)):
             self.on_event({"type": "tool_declined", "tool": tool.label, "reason": refusal})
             return {**result, "content": refusal, "is_error": True}
+        review = None
         if self.needs_approval(tool, args):
             if self.mutation_uncertain:
                 return {**result, "content": "A previous action has an uncertain outcome. Check its status and start a new conversation before another write.", "is_error": True}
             if not self.allow_orders:
                 return {**result, "content": "Blocked: ordering is disabled in this session.", "is_error": True}
-            if not await self.approve(tool, args):
+            try:
+                review = await self.mcp.prepare_review(tool, args)
+            except AccountChanged:
+                raise
+            except Exception as exc:
+                return {**result, "content": f"Could not prepare checkout review: {exc}. No order was submitted.", "is_error": True}
+            shown = {"arguments": args, "reviewed_cart": review.cart} if review else args
+            if not await self.approve(tool, copy.deepcopy(shown)):
                 self.on_event({"type": "tool_declined", "tool": tool.label})
                 return {**result, "content": "The user declined this action.", "is_error": True}
 
         self.on_event({"type": "tool_call", "tool": tool.label, "args": args, "verbose": self.verbose})
         source = "live"
         try:
-            r = await self.mcp.call_ex(block.name, args, expected_tool=tool)
+            r = await self.mcp.call_ex(block.name, args, expected_tool=tool, review=review)
             text, is_error, source = r.text, r.is_error, r.source
             if r.outcome_uncertain:
                 self.mutation_uncertain = True

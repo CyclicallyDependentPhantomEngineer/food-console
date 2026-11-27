@@ -33,7 +33,12 @@
         "search_menu",
         "search_restaurants",
         "track_food_order"
-      ]
+      ],
+      "paymentTools": {
+        "place_food_order": {
+          "adapter": "swiggy-food"
+        }
+      }
     },
     "swiggy-instamart": {
       "command": "node",
@@ -75,16 +80,10 @@
       "readOnlyTools": [
         "search",
         "payment_options",
-        "payment_status"
+        "payment_status",
+        "execute"
       ],
-      "readOnlyOperations": {
-        "execute": {
-          "argument": "operation",
-          "values": [
-            "consumer.booking_history"
-          ]
-        }
-      }
+      "_readOnlyReview": "District documents execute as the read-only dispatch endpoint; mutations use act/pay/cancel_payment. Reviewed https://studio.district.in/mcp/ on 2026-11-28. No remote annotations grant exemptions."
     },
     "zepto-mcp": {
       "command": "node",
@@ -132,5 +131,5 @@
   "_disabled": "disabled: true leaves a server out of default sets (food-ui, --provider all, food-auth --app all); naming it explicitly still works.",
   "_blockedTools": "blockedTools: tools never offered to Claude or the Actions tab. Used for ways to pay without your UPI PIN (Zepto Cash wallet, UPI Reserve Pay mandate). Remove an entry to allow it; it will still ask for approval.",
   "_readOnlyOperations": "Dispatch tools are read-only only for these exact operation argument values; all other operations require approval.",
-  "_paymentTools": "Optional reviewed structured UPI adapters: uriField and orderField paths, orderArgument, amountArgument, payeeArgument. No arbitrary text, images or opaque payment links are promoted to cards."
+  "_paymentTools": "Swiggy Food checkout uses a live cart review and the documented structured UPI fields. Other reviewed adapters may use uriField/orderField paths plus orderArgument/amountArgument/payeeArgument."
 }

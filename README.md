@@ -465,8 +465,10 @@ Instamart and Dineout together; if one fails the others keep working.
 ### District
 
 District routes almost everything through two generic tools: `search` (finds an
-operation) and `execute` (runs an operation). Only the locally reviewed
-`consumer.booking_history` operation is exempt from approval; unknown operations ask.
+operation) and `execute` (reads its result). Both are locally allowlisted: District’s
+[published contract](https://studio.district.in/mcp/) separates read-only `execute` from
+mutating `act` and `pay`. Movie/event/restaurant lookups and Stats bill/booking history
+therefore run without approval.
 Payment status and payment options are separately allowlisted. `act`, `pay`, `cancel_payment` and
 the OTP login tools always ask.
 
@@ -567,27 +569,29 @@ To turn it off again, set `"disabled": true` (and optionally
 
 ## Payments
 
-Payment cards require an explicitly configured, reviewed structured UPI adapter. The
-adapter reads one exact URI field and verifies its order ID, payee VPA, INR currency and
-exact amount against the arguments you approved. Product names, arbitrary text, images
-and opaque payment links never become payment cards.
+**Swiggy Food UPI QR is enabled by default.** Before checkout, Chat and Actions fetch a
+live cart and show its items, restaurant, delivery address ID and final total in the
+approval. That snapshot is single-use and expires after two minutes. Immediately before
+submitting, the bridge reads the cart again; changed items, address or total require a
+new review. An unavailable cart prevents submission.
 
-**The shipped remote integrations have no payment adapter enabled yet.** Complete those
-payments in the provider app or browser, then ask chat to check payment/order status.
-Blinkit's QR stays in its Chrome window. A verified adapter displays a locally generated
-UPI QR; you still check the payee and amount in your UPI app before entering your PIN.
+The adapter reads only the checkout response’s dedicated `upiIntentUrl` field. It binds
+the returned order to the approved call/address (and cart ID when supplied) and checks the UPI amount (and checkout
+total, when supplied) against the approved total. The payee comes from that dedicated
+provider payment field, never a product name or arbitrary response text. The app generates
+the QR locally and displays the payee and amount; verify both in your UPI app before
+entering your PIN. A pending payment is not a confirmed order. This follows Swiggy’s
+[cart contract](https://mcp.swiggy.com/builders/docs/reference/food/get_food_cart/) and
+[checkout contract](https://mcp.swiggy.com/builders/docs/reference/food/place_food_order/).
+External cart changes after the final check cannot be made atomic by this client; a
+conflicting checkout amount/address/cart suppresses the QR without retrying checkout.
 
-A `paymentTools` entry is a local security policy and must be based on a verified provider
-contract. For example (field names are illustrative, not a supported provider contract):
+The shipped config uses `"paymentTools": {"place_food_order": {"adapter": "swiggy-food"}}`.
+Other integrations need a reviewed adapter, or payment in the provider app/browser.
+Blinkit’s QR remains in Chrome. The generic adapter still supports `uriField`, `orderField`,
+`orderArgument`, `amountArgument` and `payeeArgument` for providers with those input
+contracts. Arbitrary images and opaque payment links are never promoted to payment cards.
 
-```json
-{"create_payment": {
-  "uriField": ["payment", "uri"], "orderField": ["order_id"],
-  "orderArgument": "order_id", "amountArgument": "amount_inr", "payeeArgument": "payee_vpa"
-}}
-```
-
-All three approval arguments must exist; missing or conflicting fields suppress the card.
 An invalid payment response cannot turn an already completed account action into a failed
 order. If an action times out or its outcome is unknown, fetch live order/payment status
 before any retry. Chat additionally blocks further writes until a new conversation is
@@ -605,9 +609,9 @@ does not display the approved amount; finish in Chrome in that case.
 Any tool that is not known to be read-only needs your explicit approval: `y` in the
 terminal, **Approve and run** in the web UI. "Known read-only" means the tool is in the locally reviewed
 `readOnlyTools` allowlist in `mcp_config.json`. Server annotations never grant an exemption.
-Generic dispatchers use `readOnlyOperations`: District `execute` runs without approval only
-for `operation=consumer.booking_history`. Other operations require approval and are blocked
-in Stats/Pick read-only sessions. Declined calls
+Mixed dispatchers can use `readOnlyOperations` to exempt only exact argument values.
+District’s documented read-only `execute` endpoint is allowlisted as a whole; `act`, `pay`
+and unknown tools still require approval and are blocked in Stats/Pick sessions. Declined calls
 are reported back to Claude as errors and it is told not to retry them. `--no-orders`
 blocks non-read-only tools outright. Manual Actions reviews are single-use, expire after
 two minutes, and bind the exact arguments, session and tool definition; editing a form
@@ -667,13 +671,21 @@ only as keyed hashes. The key lives in the **macOS Keychain** (item "food-consol
 keychain is available. If the key is lost the cache is simply treated as empty. Tool lists
 (public descriptions of each service's tools) are stored in plain text.
 
-- **Credentials define the cache boundary.** A change to provider tokens, Blinkit login or
-  MCP configuration clears private cached results, orders, picks and usage history. Running
-  sessions refuse further access and require restart. This deliberately also invalidates
-  on token refresh because providers do not expose a common stable account identity.
-  Logout clears cached personal data. Separate accounts/configurations should use separate
-  installations. On the first startup after this security upgrade, old unscoped cache data
-  and legacy `orders.json` are discarded; refresh Stats/Pick to repopulate them.
+- **Refreshes preserve your history.** Token bytes, expiry times, config formatting,
+  read-only policies and enabling another service do not reset orders, usage or picks.
+  The first upgrade preserves existing encrypted history and imports legacy `orders.json`
+  before deleting the plaintext export. Only disposable, previously unscoped tool responses
+  are refreshed on that upgrade.
+- **Account changes isolate private data.** A changed stable OAuth subject or an existing
+  service’s credential directory/endpoint starts a new local account generation. A changed Blinkit phone number also starts a new generation. Explicit
+  provider logout or `food-auth login --force` does the same. Previous private data is
+  retained in encrypted `account_archives` in the database, not served to the new account;
+  running sessions stop and require restart. `food-cache clear all` also deletes archives.
+  Opaque tokens cannot reveal which account owns them: switch those accounts through
+  `food-auth logout` / `login --force`, rather than replacing token files manually. Separate
+  installations remain the easiest way to keep independently accessible account histories.
+  The owner-only `account-scope.json` stores random generations and hashed identity hints,
+  never access tokens; OAuth claims are used only for partitioning, never to authenticate.
 - **Read-only results are cached.** An identical read within `--cache-ttl` seconds
   (default 60; `0` = fallback only) is answered locally.
 - **Fallback when a service is unavailable.** If a service is offline, rate-limited

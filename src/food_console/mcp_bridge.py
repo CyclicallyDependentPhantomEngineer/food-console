@@ -29,6 +29,7 @@ from mcp.client.stdio import stdio_client
 from .credentials import AccountChanged
 from .payments import extract as extract_payments
 from .payments import for_model as payments_for_model
+from .payments import swiggy_cart
 
 MAX_TOOL_RESULT_BYTES = 2_000_000
 MAX_TOOL_ARGS_BYTES = 64_000
@@ -227,8 +228,9 @@ def logout(url: str) -> list[Path]:
     for path in auth_files(url):
         path.unlink()
         removed.append(path)
-    from .store import clear_private_cache
-    clear_private_cache()
+    if removed:
+        from .store import clear_private_cache
+        clear_private_cache()
     return removed
 
 
@@ -386,6 +388,7 @@ class MCPBridge:
         self.payment_tools = payment_tools or {}
         self.tool_timeout = tool_timeout
         self.uncertain_servers: set[str] = set()
+        self._write_locks: dict[str, asyncio.Lock] = {}
         self.sessions: dict[str, ClientSession] = {}
         self.failed: dict[str, str] = {}
         self.tools: dict[str, BridgedTool] = {}
@@ -593,7 +596,42 @@ class MCPBridge:
         r = await self.call_ex(claude_name, arguments)
         return r.text, r.is_error
 
-    async def call_ex(self, claude_name: str, arguments: dict[str, Any], *, expected_tool: BridgedTool | None = None) -> ToolCall:
+    async def prepare_review(self, tool: BridgedTool, arguments: dict[str, Any]) -> ActionReview | None:
+        policy = self.payment_tools.get(tool.server, {}).get(tool.mcp_name, {})
+        if policy.get("adapter") != "swiggy-food":
+            return None
+        if tool.mcp_name != "place_food_order":
+            raise ValueError("Swiggy adapter only supports place_food_order")
+        cart_tool = next((t for t in self.tools.values() if t.server == tool.server
+                          and t.mcp_name == "get_food_cart" and t.read_only), None)
+        if not cart_tool or cart_tool.offline or tool.offline:
+            raise ValueError("A live Swiggy cart is required before reviewing checkout")
+        cart = await self._review_cart(cart_tool, arguments)
+        return ActionReview(tool, cart_tool, copy.deepcopy(arguments), cart, time.monotonic() + 120)
+
+    async def _review_cart(self, tool: BridgedTool, arguments: dict[str, Any]) -> dict:
+        if self.store:
+            self.store.ensure_identity()
+        raw = await asyncio.wait_for(tool.session.call_tool("get_food_cart", {"addressId": arguments["addressId"]}),
+                                     self.tool_timeout)
+        if self.store:
+            self.store.ensure_identity()
+        if len(raw.model_dump_json().encode()) > MAX_TOOL_RESULT_BYTES:
+            raise ValueError("cart response exceeds the size limit")
+        return swiggy_cart(raw, arguments)
+
+    async def call_ex(self, claude_name: str, arguments: dict[str, Any], *,
+                      expected_tool: BridgedTool | None = None, review: ActionReview | None = None) -> ToolCall:
+        tool = self.tools.get(claude_name)
+        if tool and not tool.read_only_for(arguments):
+            # Serialize local cart edits and checkout, including its final live check.
+            lock = self._write_locks.setdefault(tool.server, asyncio.Lock())
+            async with lock:
+                return await self._call_ex(claude_name, arguments, expected_tool=expected_tool, review=review)
+        return await self._call_ex(claude_name, arguments, expected_tool=expected_tool, review=review)
+
+    async def _call_ex(self, claude_name: str, arguments: dict[str, Any], *,
+                       expected_tool: BridgedTool | None = None, review: ActionReview | None = None) -> ToolCall:
         """Run a tool, using the local cache for read-only tools when that helps.
 
         - read-only + identical call within `cache_ttl`: served from cache (no request), except
@@ -615,6 +653,24 @@ class MCPBridge:
         read_only = bridged.read_only_for(arguments)
         if not read_only and bridged.server in self.uncertain_servers:
             return ToolCall("A previous action has an uncertain outcome. Fetch live order/payment status before another write.", True)
+        policy = self.payment_tools.get(bridged.server, {}).get(bridged.mcp_name, {})
+        if policy.get("adapter") == "swiggy-food":
+            if (not review or review.used or review.expires <= time.monotonic()
+                    or review.tool is not bridged or review.arguments != arguments
+                    or self.tools.get(review.cart_tool.claude_name) is not review.cart_tool):
+                return ToolCall("Review the current Swiggy cart before placing this order.", True)
+            review.used = True
+            try:
+                current_cart = await self._review_cart(review.cart_tool, arguments)
+                if current_cart != review.cart:
+                    return ToolCall("The cart changed after approval. Review the updated cart before placing the order.", True)
+                if (review.expires <= time.monotonic() or self.tools.get(claude_name) is not bridged
+                        or self.tools.get(review.cart_tool.claude_name) is not review.cart_tool):
+                    return ToolCall("Review expired or tools changed while checking the cart. Review the action again.", True)
+            except AccountChanged:
+                raise
+            except Exception:
+                return ToolCall("Could not recheck the live cart. No order was submitted; review it again when connected.", True)
         cacheable = read_only and store is not None
         cached = store.get_result(bridged.server, bridged.mcp_name, arguments) if cacheable else None
 
@@ -672,11 +728,12 @@ class MCPBridge:
             policy = self.payment_tools.get(bridged.server, {}).get(bridged.mcp_name)
             if policy:
                 try:
-                    payments = extract_payments(raw, policy=policy, arguments=arguments)
+                    payments = extract_payments(raw, policy=policy, arguments=arguments,
+                                                reviewed_cart=review.cart if review else None)
                     text = payments_for_model(text, payments)
                 except Exception:
                     # Never turn a completed order into a tool failure or a retry.
-                    text += "\n[Action succeeded; payment display failed. Check status and complete payment in the provider app. Do not repeat the action.]"
+                    text += "\n[Action returned; payment display failed validation. Check status and complete payment in the provider app. Do not repeat the action.]"
         if not is_error and cacheable:
             store.put_result(bridged.server, bridged.mcp_name, arguments, text)
         if not is_error and read_only and re.search(r"status|track|order.*history|orders|order_detail", bridged.mcp_name, re.I):
@@ -693,6 +750,16 @@ class MCPBridge:
 
 
 _RATE_LIMIT = re.compile(r"\b429\b|too many requests|rate[ -]?limit", re.I)
+
+
+@dataclass
+class ActionReview:
+    tool: BridgedTool
+    cart_tool: BridgedTool
+    arguments: dict[str, Any]
+    cart: dict[str, Any]
+    expires: float
+    used: bool = False
 
 
 @dataclass

@@ -24,6 +24,11 @@ def _fernet(path: Path) -> Fernet:
 
 
 def save_state(state: dict[str, Any], path: Path = SESSION_PATH) -> None:
+    if path == SESSION_PATH and path.exists():
+        previous, current = _phone(load_state(path)), _phone(state)
+        if previous and current and previous != current:
+            from ..store import clear_private_cache
+            clear_private_cache()
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
     token = _fernet(path).encrypt(json.dumps(state).encode())
@@ -32,6 +37,22 @@ def save_state(state: dict[str, Any], path: Path = SESSION_PATH) -> None:
     with os.fdopen(fd, "wb") as f:
         f.write(token)
     os.replace(tmp, path)
+
+
+def _phone(state: dict[str, Any] | None) -> str | None:
+    """Stable login identity; access-token and cart refreshes are deliberately ignored."""
+    for origin in (state or {}).get("origins", []):
+        if origin.get("origin") != "https://blinkit.com":
+            continue
+        for item in origin.get("localStorage", []):
+            if item.get("name") == "auth":
+                try:
+                    phone = json.loads(item.get("value") or "{}").get("phoneNumber")
+                    if isinstance(phone, str) and phone:
+                        return phone
+                except (ValueError, AttributeError):
+                    pass
+    return None
 
 
 def load_state(path: Path = SESSION_PATH) -> dict[str, Any] | None:

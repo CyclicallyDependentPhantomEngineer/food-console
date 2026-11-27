@@ -31,12 +31,12 @@ def test_store_roundtrip_and_permissions(tmp_path):
     assert s.clear("orders") >= 1 and s.load_orders() is None
 
 
-def test_unscoped_legacy_json_is_discarded(tmp_path):
+def test_legacy_json_is_imported_and_encrypted(tmp_path):
     (tmp_path / "orders.json").write_text(json.dumps({"orders": [{"provider": "zomato", "service": "food", "order_id": "9"}],
                                                       "fetched_at": "t"}))
     s = Store(tmp_path / "food.db")
-    assert s.load_orders() is None
-    assert not (tmp_path / "orders.json").exists()  # unscoped plaintext is not imported across accounts
+    assert s.load_orders()["orders"][0]["order_id"] == "9"
+    assert not (tmp_path / "orders.json").exists()  # removed only after encrypted import
 
 
 def _flaky_server(tmp_path, mode_file):
@@ -146,7 +146,7 @@ def test_plaintext_v1_database_is_upgraded(tmp_path):
     db.commit(); db.close()
     s = Store(tmp_path / "food.db")
     assert s.get_result("zomato", "get_order_history", {}) is None
-    assert s.load_orders() is None
+    assert s.load_orders()["orders"][0]["merchant"] == "SECRET-PLACE"
     s.close()
     raw = b"".join(p.read_bytes() for p in tmp_path.glob("food.db*") if not p.name.endswith(".key"))
     assert b"SECRET-RESULT" not in raw and b"SECRET-PLACE" not in raw

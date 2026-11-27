@@ -269,6 +269,9 @@ def build_app(state: AppState) -> Starlette:
             return HTMLResponse(SIGNED_OUT_PAGE.format(msg="You are not signed in."), status_code=401)
         return FileResponse(STATIC / "index.html")
 
+    async def favicon(request: Request) -> Response:
+        return Response(status_code=204)
+
     async def status(request: Request) -> Response:
         mcp = state.mcp
         return JSONResponse({
@@ -302,6 +305,7 @@ def build_app(state: AppState) -> Starlette:
         if not isinstance(args, dict):
             return JSONResponse({"error": "args must be an object"}, status_code=400)
         expected_tool = tool
+        review = None
         if body.get("review") is True or body.get("approval_id") or state.chat.needs_approval(tool, args):
             sid = request.cookies.get(SESSION_COOKIE, "")
             now = time.monotonic()
@@ -309,18 +313,24 @@ def build_app(state: AppState) -> Starlette:
             if body.get("confirm") is not True:
                 if len(state.manual_approvals) >= 100:
                     return JSONResponse({"error": "too many pending reviews"}, status_code=429)
+                try:
+                    review = await state.mcp.prepare_review(tool, args)
+                except Exception as exc:
+                    return JSONResponse({"error": f"Could not prepare checkout review: {exc}. No order was submitted."}, status_code=409)
                 approval_id = secrets.token_urlsafe(24)
                 state.manual_approvals[approval_id] = {"session": sid, "tool": tool, "args": copy.deepcopy(args),
-                                                     "expires": now + APPROVAL_SECONDS}
-                return JSONResponse({"error": "confirmation required", "approval_id": approval_id}, status_code=409)
+                                                     "review": review, "expires": time.monotonic() + APPROVAL_SECONDS}
+                return JSONResponse({"error": "confirmation required", "approval_id": approval_id,
+                                     "reviewed_cart": review.cart if review else None}, status_code=409)
             record = state.manual_approvals.pop(body.get("approval_id", ""), None)
             if (not record or record["session"] != sid or record["tool"] is not tool
                     or json.dumps(record["args"], sort_keys=True) != json.dumps(args, sort_keys=True)):
                 return JSONResponse({"error": "review expired or changed; review the action again"}, status_code=409)
             args, expected_tool = record["args"], record["tool"]
+            review = record["review"]
         payments: list[dict[str, Any]] = []
         try:
-            r = await state.mcp.call_ex(name, args, expected_tool=expected_tool)
+            r = await state.mcp.call_ex(name, args, expected_tool=expected_tool, review=review)
             text, is_error, source, cached_at, payments = r.text, r.is_error, r.source, r.cached_at, r.payments
         except Exception as exc:
             text, is_error, source, cached_at = f"Tool call failed: {exc}", True, "live", None
@@ -566,6 +576,7 @@ def build_app(state: AppState) -> Starlette:
     return Starlette(
         routes=[
             Route("/", index),
+            Route("/favicon.ico", favicon),
             Route("/login", login),
             Route("/api/logout", logout_session, methods=["POST"]),
             Route("/api/status", status),

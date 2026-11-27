@@ -92,7 +92,7 @@ def test_rendering_failure_keeps_write_success_and_invalidates_cache(tmp_path, m
         raise ValueError("bad QR")
     monkeypatch.setattr("food_console.mcp_bridge.extract_payments", fail)
     result = asyncio.run(bridge.call_ex("place_order", {}))
-    assert not result.is_error and "succeeded; payment display failed" in result.text
+    assert not result.is_error and "payment display failed validation" in result.text
     assert store.get_result("food", "get_cart", {}) is None
     assert tool.session.call_tool.await_count == 1
 
@@ -125,7 +125,7 @@ def test_replaced_tool_cannot_use_an_old_approval():
     after.session.call_tool.assert_not_called()
 
 
-def test_credential_change_clears_all_personal_state_and_blocks_old_process(tmp_path):
+def test_account_change_archives_personal_state_and_blocks_old_process(tmp_path):
     identity = ["account-A"]
     source = lambda: identity[0]
     path = tmp_path / "food.db"
@@ -146,9 +146,17 @@ def test_credential_change_clears_all_personal_state_and_blocks_old_process(tmp_
     with pytest.raises(AccountChanged):
         old.get_result("food", "get_addresses", {})
     assert current.get_result("food", "get_addresses", {}).text == "B"
+    assert current.db.execute("SELECT COUNT(*) FROM account_archives").fetchone()[0] == 1
+    identity[0] = "account-A"
+    restored = Store(path, credential_source=source)
+    assert restored.load_orders()["orders"][0]["order_id"] == "42"
+    assert restored.load_usage()[0]["label"] == "A's private prompt"
+    assert restored.load_pick()["address"] == "A"
+    with pytest.raises(AccountChanged):
+        current.load_orders()
 
 
-def test_real_credential_digest_tracks_token_rotation_and_directory(tmp_path, monkeypatch):
+def test_real_identity_preserves_refresh_config_edits_and_new_services(tmp_path, monkeypatch):
     from food_console.credentials import credential_fingerprint
     from food_console.blinkit import session
     url = "https://example.test/mcp"
@@ -164,12 +172,68 @@ def test_real_credential_digest_tracks_token_rotation_and_directory(tmp_path, mo
     first = credential_fingerprint(config)
     file.write_text('{"access_token":"account-B-secret"}')
     second = credential_fingerprint(config)
-    assert len({before, first, second}) == 3
+    assert before == first == second
     assert "secret" not in second
     file.unlink()
     assert credential_fingerprint(config) == before
     monkeypatch.setenv("MCP_REMOTE_CONFIG_DIR", str(tmp_path / "different-empty-dir"))
     assert credential_fingerprint(config) != before
+
+
+def test_stable_subject_rotation_preserves_all_history_and_real_switch_isolates(tmp_path, monkeypatch):
+    from food_console.credentials import credential_fingerprint
+    import food_console.store as store_module
+    url = "https://example.test/mcp"
+    config = tmp_path / "config.json"
+    entries = {"food": {"args": [url], "disabled": False}}
+    config.write_text(json.dumps({"mcpServers": entries}))
+    directory = tmp_path / "tokens"
+    monkeypatch.setenv("MCP_REMOTE_CONFIG_DIR", str(directory))
+    tokens = directory / "mcp-remote-v1"
+    tokens.mkdir(parents=True)
+    token_file = tokens / (hashlib.md5(url.encode()).hexdigest() + "_tokens.json")
+    def token(subject, expiry):
+        claims = base64.urlsafe_b64encode(json.dumps({"sub": subject, "iss": "provider", "exp": expiry}).encode()).decode()
+        token_file.write_text(json.dumps({"access_token": f"head.{claims}.sig", "refresh_token": str(expiry)}))
+    token("account-A", 1)
+    source = lambda: credential_fingerprint(config)
+    monkeypatch.setattr(store_module, "credential_fingerprint", source)
+    s = Store(tmp_path / "food.db")
+    s.save_orders({"orders": [{"provider": "food", "order_id": str(i)} for i in range(84)]})
+    s.save_usage({"label": "keep my history"})
+    s.save_pick({"dish": "keep my pick"})
+    s.put_result("food", "get_addresses", {}, "address A")
+    token("account-A", 2)  # District-style refresh
+    entries["food"]["disabled"] = True
+    entries["new-service"] = {"args": ["https://new.test/mcp"], "readOnlyTools": ["search"]}
+    config.write_text(json.dumps({"mcpServers": entries, "comment": "unrelated edit"}))
+    assert len(s.load_orders()["orders"]) == 84
+    assert s.load_usage()[0]["label"] == "keep my history"
+    assert s.load_pick()["dish"] == "keep my pick"
+    assert s.get_result("food", "get_addresses", {}).text == "address A"
+    reopened = Store(tmp_path / "food.db")
+    assert len(reopened.load_orders()["orders"]) == 84
+    token("account-B", 3)
+    with pytest.raises(AccountChanged):
+        s.load_orders()
+    new_account = Store(tmp_path / "food.db")
+    assert new_account.load_orders() is None
+    assert new_account.db.execute("SELECT COUNT(*) FROM account_archives").fetchone()[0] == 1
+
+
+def test_explicit_logout_rotates_opaque_account_generation(tmp_path, monkeypatch):
+    from food_console.credentials import credential_fingerprint
+    import food_console.store as store_module
+    monkeypatch.setenv("MCP_REMOTE_CONFIG_DIR", str(tmp_path / "auth"))
+    monkeypatch.setattr(store_module, "credential_fingerprint", credential_fingerprint)
+    s = Store()
+    s.save_orders({"orders": [{"provider": "food", "order_id": "keep"}]})
+    store_module.clear_private_cache()
+    with pytest.raises(AccountChanged):
+        s.load_orders()
+    current = Store()
+    assert current.load_orders() is None
+    assert current.db.execute("SELECT COUNT(*) FROM account_archives").fetchone()[0] == 1
 
 
 def test_transport_uses_locked_runtime_and_matching_credential_directory(monkeypatch):
@@ -181,14 +245,20 @@ def test_transport_uses_locked_runtime_and_matching_credential_directory(monkeyp
     assert params.env["MCP_REMOTE_CONFIG_DIR"] == "/tmp/test-credentials"
 
 
-def test_unscoped_encrypted_cache_is_cleared_on_upgrade(tmp_path):
+def test_upgrade_preserves_84_orders_usage_and_pick_but_refreshes_unscoped_responses(tmp_path):
     path = tmp_path / "food.db"
     old = Store(path)
     old.put_result("food", "get_addresses", {}, "old account")
+    old.save_orders({"orders": [{"provider": "food", "order_id": str(i)} for i in range(84)]})
+    old.save_usage({"label": "saved usage"})
+    old.save_pick({"dish": "saved pick"})
     old.db.execute("DROP TABLE credential_scope")
     old.close()
     upgraded = Store(path)
     assert upgraded.get_result("food", "get_addresses", {}) is None
+    assert len(upgraded.load_orders()["orders"]) == 84
+    assert upgraded.load_usage()[0]["label"] == "saved usage"
+    assert upgraded.load_pick()["dish"] == "saved pick"
 
 
 def test_approval_requires_review_and_is_bound_to_args_session_and_one_use(client):
@@ -302,3 +372,35 @@ def test_actual_actions_handler_submits_reviewed_snapshot():
     ''')
     assert result[-1]["args"] == {"amount": 100}
     assert result[-1]["approval_id"] == "review-token"
+
+
+def test_blinkit_refresh_preserves_history_and_phone_switch_isolates(tmp_path, monkeypatch):
+    from food_console.blinkit import session
+    from food_console.credentials import credential_fingerprint
+    import food_console.store as store_module
+    monkeypatch.setattr(store_module, "credential_fingerprint", credential_fingerprint)
+    path = store_module.DB_PATH.with_name("blinkit_session.enc")
+    monkeypatch.setattr(session, "SESSION_PATH", path)
+    def state(phone, token):
+        return {"origins": [{"origin": "https://blinkit.com", "localStorage": [{"name": "auth", "value":
+            json.dumps({"phoneNumber": phone, "accessToken": token})}]}]}
+    session.save_state(state("111", "token-1"), path)
+    s = Store()
+    s.save_orders({"orders": [{"provider": "blinkit", "order_id": "keep"}]})
+    session.save_state(state("111", "token-2"), path)
+    assert s.load_orders()["orders"][0]["order_id"] == "keep"
+    session.save_state(state("222", "token-3"), path)
+    with pytest.raises(AccountChanged):
+        s.load_orders()
+    assert Store().load_orders() is None
+
+
+def test_token_scope_upgrade_preserves_history_from_earlier_pr_build(tmp_path):
+    path = tmp_path / "food.db"
+    s = Store(path)
+    s.save_orders({"orders": [{"provider": "food", "order_id": "keep"}]})
+    s.db.execute("DELETE FROM credential_scope WHERE slot=2")
+    s.db.execute("UPDATE credential_scope SET identity='old-token-bytes-hash' WHERE slot=1")
+    s.close()
+    upgraded = Store(path)
+    assert upgraded.load_orders()["orders"][0]["order_id"] == "keep"

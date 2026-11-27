@@ -146,31 +146,58 @@ class Store:
         # Separate HMAC key derived from the encryption key, for lookup hashes.
         self._mac_key = hashlib.sha256(b"food-console/lookup/" + self._key).digest()
         self._upgrade()
-        # Unscoped legacy exports cannot be attributed to the current account.
-        self.path.with_name("orders.json").unlink(missing_ok=True)
         self._credential_source = credential_source or credential_fingerprint
         self._identity = self._mac(self._credential_source())
         self._stale_identity = False
         self.db.execute("CREATE TABLE IF NOT EXISTS credential_scope (slot INTEGER PRIMARY KEY, identity TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS account_archives (identity TEXT PRIMARY KEY, data_enc TEXT NOT NULL)")
+        # Upgrade the old token-byte scope in place, preserving the owner's history.
+        # Slot 2 is the stable-generation format marker; slot 1 remains the active scope.
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            if not self.db.execute("SELECT 1 FROM credential_scope WHERE slot=2").fetchone():
+                self.db.execute("INSERT OR REPLACE INTO credential_scope VALUES (1, ?)", (self._identity,))
+                self.db.execute("INSERT OR REPLACE INTO credential_scope VALUES (2, 'stable-generation-v1')")
+                self.db.execute("DELETE FROM tool_results")  # refresh disposable, previously unscoped responses
         self._bind_identity(self._identity)
+        legacy = self.path.with_name("orders.json")
+        if legacy.exists():
+            self.save_orders(json.loads(legacy.read_text()))
+            legacy.unlink()  # only after successful encrypted import
 
-    def _bind_identity(self, identity: str) -> None:
-        # Atomically discard every private table on the first secure startup or a
-        # credential/config change. Public tool schemas can be rediscovered safely.
+    def _bind_identity(self, identity: str, *, expected: str | None = None) -> None:
+        # Account switches archive private data; refreshes never arrive here.
+        tables = ("tool_results", "orders_enc", "meta_enc", "picks_enc", "usage_runs")
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.db.execute("SELECT identity FROM credential_scope WHERE slot=1").fetchone()
+            if expected is not None and (not row or row[0] != expected):
+                raise AccountChanged()
             if row is None or row[0] != identity:
-                for table in ("tool_results", "orders_enc", "meta_enc", "picks_enc", "usage_runs", "tool_defs"):
+                if row:
+                    snapshot = {t: self.db.execute(f"SELECT * FROM {t}").fetchall() for t in tables}
+                    self.db.execute("INSERT OR REPLACE INTO account_archives VALUES (?, ?)",
+                                    (row[0], self._enc(json.dumps(snapshot))))
+                for table in tables:
                     self.db.execute(f"DELETE FROM {table}")
+                saved = self.db.execute("SELECT data_enc FROM account_archives WHERE identity=?", (identity,)).fetchone()
+                if saved:
+                    snapshot = json.loads(self._dec(saved[0]))
+                    for table in tables:
+                        for values in snapshot.get(table, []):
+                            self.db.execute(f"INSERT INTO {table} VALUES ({','.join('?' for _ in values)})", values)
+                    self.db.execute("DELETE FROM account_archives WHERE identity=?", (identity,))
                 self.db.execute("INSERT OR REPLACE INTO credential_scope VALUES (1, ?)", (identity,))
 
     def ensure_identity(self) -> None:
-        current = self._mac(self._credential_source())
         row = self.db.execute("SELECT identity FROM credential_scope WHERE slot=1").fetchone()
-        if current != self._identity or not row or row[0] != self._identity:
-            self._bind_identity(current)
+        if self._stale_identity or not row or row[0] != self._identity:
             self._stale_identity = True
+            raise AccountChanged()
+        current = self._mac(self._credential_source())
+        if current != self._identity:
+            self._stale_identity = True
+            self._bind_identity(current, expected=self._identity)
         if self._stale_identity:
             raise AccountChanged()
 
@@ -321,7 +348,7 @@ class Store:
     def clear(self, what: str = "results", server: str | None = None) -> int:
         tables = {"results": ["tool_results"], "tools": ["tool_defs"], "orders": ["orders_enc", "meta_enc"],
                   "picks": ["picks_enc"], "usage": ["usage_runs"],
-                  "all": ["tool_results", "tool_defs", "orders_enc", "meta_enc", "picks_enc", "usage_runs"]}[what]
+                  "all": ["tool_results", "tool_defs", "orders_enc", "meta_enc", "picks_enc", "usage_runs", "account_archives"]}[what]
         n = 0
         with self.db:
             self.db.execute("BEGIN")
@@ -371,13 +398,15 @@ class Store:
             self.db.execute("VACUUM")  # rewrite the file so the old plaintext pages are gone
 
 def clear_private_cache() -> None:
-    """Logout clears persisted personal data even before the next application read."""
+    """Start a separate account generation on explicit provider logout.
+
+    Old encrypted history is archived, never silently deleted by a login refresh.
+    """
+    from .credentials import credential_fingerprint as rotate_scope
+    rotate_scope(rotate=True)
     if DB_PATH.exists():
         s = Store()
-        try:
-            s.clear("all")
-        finally:
-            s.close()
+        s.close()
 
 
 def main() -> None:

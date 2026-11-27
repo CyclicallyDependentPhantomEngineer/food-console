@@ -97,17 +97,94 @@ def _strings(node: Any):
             yield from _strings(v)
 
 
+def swiggy_payload(result: Any) -> dict:
+    """Swiggy's documented structuredContent / JSON-envelope response contract.
+
+    https://mcp.swiggy.com/builders/docs/build/read-tool-results/
+    Never search human summaries, product fields, or images for payment authority.
+    """
+    from mcp import types
+    if result.is_error:
+        raise ValueError("Swiggy could not verify the cart/payment")
+    data = result.structured_content
+    if data is None:
+        if len(result.content) != 1 or not isinstance(result.content[0], types.TextContent):
+            raise ValueError("missing structured Swiggy response")
+        envelope = json.loads(result.content[0].text)
+        if envelope.get("success") is not True:
+            raise ValueError("unsuccessful Swiggy response")
+        data = envelope["data"]
+    if not isinstance(data, dict) or data.get("success") is False:
+        raise ValueError("invalid Swiggy response")
+    return data
+
+
+def swiggy_cart(result: Any, arguments: dict) -> dict:
+    """Canonical fields shown at review and rechecked immediately before checkout.
+
+    https://mcp.swiggy.com/builders/docs/reference/food/get_food_cart/
+    """
+    data = swiggy_payload(result)
+    cart = data["data"]
+    if data.get("addressId") != arguments.get("addressId"):
+        raise ValueError("cart address does not match the order")
+    cart_id = cart.get("cart_id")
+    items = cart.get("items")
+    if ((cart_id is not None and (not isinstance(cart_id, str) or not cart_id))
+            or not isinstance(items, list) or not items
+            or any(not isinstance(item, dict) or not item.get("menu_item_id") or not item.get("quantity") for item in items)):
+        raise ValueError("cart cannot be verified")
+    selected = [{k: item[k] for k in ("menu_item_id", "name", "quantity", "subtotal", "total",
+                                     "final_price", "variants", "addons") if k in item} for item in items]
+    return {"cart_id": cart_id, "address_id": data["addressId"],
+            "total_inr": str(money(cart["pricing"]["to_pay"]).quantize(Decimal("0.01"))),
+            "restaurant": {k: v for k, v in (cart.get("restaurant") or {}).items() if k in ("id", "name", "area")},
+            "items": selected}
+
+
+def swiggy_payment(result: Any, arguments: dict, reviewed_cart: dict | None) -> list[dict[str, Any]]:
+    """The dedicated checkout URI must match the approved cart/address and total.
+
+    https://mcp.swiggy.com/builders/docs/reference/food/place_food_order/
+    """
+    if arguments.get("paymentMethod") != "UPI":
+        return []
+    if not reviewed_cart:
+        raise ValueError("missing approved cart")
+    data = swiggy_payload(result)
+    if (data.get("status") != "PENDING_PAYMENT" or data.get("paymentMethod") != "UPI"
+            or (data.get("cartId") is not None and reviewed_cart["cart_id"] is not None
+                and data["cartId"] != reviewed_cart["cart_id"])
+            or data.get("addressId") != reviewed_cart["address_id"]):
+        raise ValueError("payment does not belong to the approved cart")
+    order = data.get("orderId")
+    if not isinstance(order, str) or not order or not data.get("paasId"):
+        raise ValueError("missing payment order identity")
+    uri = data.get("upiIntentUrl")
+    if not isinstance(uri, str) or urlsplit(uri).netloc != "pay":
+        raise ValueError("invalid checkout UPI URI")
+    item = upi_item(uri)
+    amount = money(reviewed_cart["total_inr"])
+    if item is None or money(item["amount_inr"]) != amount:
+        raise ValueError("QR amount differs from the approved total")
+    if data.get("totalAmount") is not None and money(data["totalAmount"]) != amount:
+        raise ValueError("checkout total differs from the approved total")
+    return [{**item, "order_id": order}]
+
+
 def extract(result: Any, *, policy: dict[str, Any] | None = None,
-            arguments: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+            arguments: dict[str, Any] | None = None, reviewed_cart: dict | None = None) -> list[dict[str, Any]]:
     """Only a reviewed structured field bound to the approved order/payee/amount.
 
-    No built-in remote adapter is assumed: opaque links and images cannot establish
-    those bindings and must be completed in the provider app instead.
+    A locally selected adapter supplies the binding contract. Opaque links and images
+    cannot establish those bindings and stay in the provider app instead.
     """
     from mcp import types
     if not policy:
         return []
     args = arguments or {}
+    if policy.get("adapter") == "swiggy-food":
+        return swiggy_payment(result, args, reviewed_cart)
     data = getattr(result, "structured_content", None)
     if data is None:
         blocks = getattr(result, "content", [])
