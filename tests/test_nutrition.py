@@ -116,3 +116,92 @@ def test_pick_tools_are_read_only_search_tools():
     assert not keep(tool("get_cart"))  # read-only but not needed to pick
     assert not keep(tool("get_order_history"))
     assert not keep(tool("search_restaurants", server="food"))  # other platform
+
+
+def test_parse_saved_addresses_from_both_platforms():
+    from food_console.nutrition import describe_address, parse_addresses
+
+    zomato = json.dumps({"addresses": [{"address_id": "111", "label": "Home", "location_name": "12, MG Road, Bengaluru"},
+                                       {"address_id": "", "label": "broken"}], "success": True, "message": None})
+    swiggy = ("Found 2 saved addresses (page 1 of 1, showing 2):\n"
+              "1. [home blr] A Person: 12, MG Road, Bengaluru 560001, India (id: d4abc12__xyz)\n"
+              "2. [Office] B Person: Tower 2, Outer Ring Road, Bengaluru (id: e9f00__q1)\n")
+    z, s = parse_addresses("zomato", zomato), parse_addresses("food", swiggy)
+    assert z == [{"server": "zomato", "id": "111", "label": "Home", "text": "12, MG Road, Bengaluru"}]
+    assert [(a["id"], a["label"]) for a in s] == [("d4abc12__xyz", "home blr"), ("e9f00__q1", "Office")]
+    assert s[0]["text"] == "12, MG Road, Bengaluru 560001, India"
+    assert parse_addresses("food", "no addresses") == []
+
+    hint = describe_address(z[0], ["zomato", "food"])
+    assert "address id is 111" in hint and "Swiggy Food" in hint and "same location" in hint
+    assert "same location" not in describe_address(z[0], ["zomato"])  # single platform: nothing to match
+
+
+def test_restaurant_distances_from_both_platforms():
+    from food_console.nutrition import listed_distances, listed_nutrition
+
+    zomato = json.dumps({"results": [{"res_id": 21122812, "name": "BOX8", "distance": 2.4, "eta": "25-30 mins",
+                                      "items": [{"variant_id": "v_9", "name": "x"}]}]})
+    # Swiggy: JSON followed by a text note.
+    swiggy = json.dumps({"restaurants": [{"id": "52989", "name": "R", "distanceKm": 0.8, "deliveryTimeMinutes": 31},
+                                         {"id": "426", "name": "S", "distanceKm": 1.8}], "dishes": []}) + \
+        "\n\n⚠️ A rich UI widget may be shown to the user with this data."
+    km = listed_distances([zomato, swiggy, "not json"])
+    assert km == {"21122812": 2.4, "52989": 0.8, "426": 1.8}
+    # The same trailing-note format must not hide nutrition either.
+    swiggy_dish = json.dumps({"dishes": [{"id": "d1", "nutrition": {"calories": 300, "protein": 30}}]}) + "\n\nnote"
+    assert listed_nutrition([swiggy_dish])["d1"].kcal == 300
+
+
+def test_distance_attached_to_dishes_and_claims_checked():
+    goal = resolve_goal({"goal": "custom"})
+    tool = json.dumps({"restaurants": [{"id": "52989", "distanceKm": 0.8}]})
+    r = build_result({"dishes": [
+        dish("a", "Tikka", 400, 40, merchant_id="52989"),                        # distance from tool data
+        dish("b", "Kebab", 400, 40, merchant_id="777", distance_km=0.3),         # claimed, not in any result
+        dish("c", "Wrap", 400, 40, merchant_id="888", distance_km=-1),
+    ]}, [tool], goal)
+    by = {d["item_id"]: d for d in r["dishes"]}
+    assert by["a"]["distance_km"] == 0.8 and by["b"]["distance_km"] is None and by["c"]["distance_km"] is None
+
+
+def test_craving_is_the_only_search_keyword():
+    from types import SimpleNamespace
+
+    from food_console.nutrition import craving_guard
+
+    def tool(*params):
+        return SimpleNamespace(tool=SimpleNamespace(input_schema={"properties": {p: {"type": "string"} for p in params}}))
+
+    guard = craving_guard("Paneer Tikka")
+    zomato_search, swiggy_search, menu = tool("keyword", "address_id"), tool("query", "addressId"), tool("res_id", "address_id")
+    assert guard(zomato_search, {"keyword": "paneer tikka", "address_id": "1"}) is None     # case-insensitive
+    assert guard(swiggy_search, {"query": "Paneer  Tikka!"}) is None                         # spacing/punctuation
+    assert "only" in guard(zomato_search, {"keyword": "grilled chicken"})
+    assert "only" in guard(swiggy_search, {"query": "paneer tikka high protein"})            # extra words refused
+    assert "Refused" in guard(zomato_search, {"address_id": "1"})                            # no keyword = recommendations
+    assert guard(menu, {"res_id": 5, "address_id": "1"}) is None                             # not a search tool
+
+
+def test_dishes_marked_off_craving_are_dropped():
+    r = build_result({"dishes": [dish("a", "Paneer Tikka", 400, 30, matches_craving=True),
+                                 dish("b", "Chicken Tikka", 350, 40, matches_craving=False),
+                                 dish("c", "Paneer Bhurji", 450, 28)]}, [], resolve_goal({"goal": "lean"}))
+    assert [d["item_id"] for d in r["dishes"]] == ["a", "c"] and r["dropped_off_craving"] == 1
+
+
+def test_treat_ignores_calories_and_protein():
+    from food_console.nutrition import search_rule
+
+    goal = resolve_goal({"goal": "treat", "max_kcal": 500, "min_protein": 40, "max_price": 400})
+    assert goal["max_kcal"] is None and goal["min_protein"] is None and goal["max_price"] == 400
+    assert goal["sort"] == "rating" and "no calorie or protein limits" in describe_goal(goal)
+    r = build_result({"dishes": [
+        dish("a", "Loaded Pizza", 1400, 30, price=380, rating=4.6),
+        dish("b", "Brownie Sundae", 900, 8, price=250, rating=4.8),
+        dish("c", "Pricey Platter", 1800, 60, price=650, rating=4.9),    # over the price limit
+    ]}, [], goal)
+    assert [d["item_id"] for d in r["dishes"]] == ["b", "a", "c"]     # fits first, then best rated
+    assert r["fits"] == 2 and [c["name"] for c in r["dishes"][0]["checks"]] == ["price"]
+    assert rank(r["dishes"], "indulgent")[0]["item_id"] == "a"         # most calories among those that fit
+    assert "pizza" in search_rule("", goal) and "paneer" in search_rule("paneer", goal)   # a craving still wins

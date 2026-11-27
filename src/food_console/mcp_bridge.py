@@ -14,12 +14,15 @@ import subprocess
 import sys
 import time
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
+
+from .payments import extract as extract_payments
+from .payments import for_model as payments_for_model
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "mcp_config.json"
 
@@ -107,6 +110,13 @@ def load_read_only_tools(server: str, config_path: Path = DEFAULT_CONFIG) -> set
     """The `readOnlyTools` allowlist for a server that doesn't label its tools (empty if none)."""
     config = json.loads(config_path.read_text())
     return set(config["mcpServers"][server].get("readOnlyTools", []))
+
+
+def load_blocked_tools(server: str, config_path: Path = DEFAULT_CONFIG) -> set[str]:
+    """The `blockedTools` list for a server: tools never offered to Claude or the Actions tab
+    (e.g. ways to pay without the user's UPI PIN)."""
+    config = json.loads(config_path.read_text())
+    return set(config["mcpServers"][server].get("blockedTools", []))
 
 
 def server_url(params: StdioServerParameters) -> str | None:
@@ -317,6 +327,7 @@ class MCPBridge:
         store: Any = None,
         cache_ttl: float = 60,
         read_only_tools: dict[str, set[str]] | None = None,
+        blocked_tools: dict[str, set[str]] | None = None,
     ):
         self._servers = servers
         self._params = dict(servers)
@@ -331,6 +342,7 @@ class MCPBridge:
         self.cache_ttl = cache_ttl
         # {server label: tool names} that may run without approval on unlabelled servers.
         self.read_only_tools = read_only_tools or {}
+        self.blocked_tools = blocked_tools or {}
         self.sessions: dict[str, ClientSession] = {}
         self.failed: dict[str, str] = {}
         self.tools: dict[str, BridgedTool] = {}
@@ -496,6 +508,8 @@ class MCPBridge:
                 continue
             # Sorted so the tool list is byte-stable across runs (keeps prompt cache warm).
             for tool in sorted(result.tools, key=lambda t: t.name):
+                if tool.name in self.blocked_tools.get(label, ()):
+                    continue
                 raw = f"{label}_{tool.name}" if prefix else tool.name
                 claude_name = _INVALID_NAME_CHARS.sub("_", raw)[:64]
                 if claude_name in tools:
@@ -559,7 +573,8 @@ class MCPBridge:
             return ToolCall(f"{bridged.server} is offline ({why}) and there is no cached result for this "
                             "request yet. Tell the user it can't be fetched right now.", True)
         try:
-            text, is_error = _render_result(await bridged.session.call_tool(bridged.mcp_name, arguments))
+            raw = await bridged.session.call_tool(bridged.mcp_name, arguments)
+            text, is_error = _render_result(raw)
         except Exception as exc:
             if cached:
                 return self._from_cache(cached, f"the request to {bridged.server} failed ({exc})")
@@ -568,12 +583,17 @@ class MCPBridge:
             if cached:
                 return self._from_cache(cached, f"{bridged.server} is rate-limiting requests")
             return ToolCall(text, True)
+        payments: list[dict[str, Any]] = []
+        if not bridged.read_only and not is_error:
+            # Account-changing tools only: a QR or payment link the server meant for its widget.
+            payments = extract_payments(raw)
+            text = payments_for_model(text, payments)
         if not is_error and store is not None:
             if cacheable:
                 store.put_result(bridged.server, bridged.mcp_name, arguments, text)
             elif not bridged.read_only:
                 store.invalidate(bridged.server)
-        return ToolCall(text, is_error)
+        return ToolCall(text, is_error, payments=payments)
 
     @staticmethod
     def _from_cache(cached: Any, why: str) -> "ToolCall":
@@ -593,6 +613,7 @@ class ToolCall:
     is_error: bool
     source: str = "live"  # live | cache (fresh hit) | cache-fallback (server unavailable)
     cached_at: str | None = None
+    payments: list[dict[str, Any]] = field(default_factory=list)  # QR codes / payment links to show the user
 
 
 def _render_result(result: Any) -> tuple[str, bool]:

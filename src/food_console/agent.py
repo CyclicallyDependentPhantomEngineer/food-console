@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import re
+import sys
+import time
 from datetime import date
 from typing import Any, Awaitable, Callable
 
@@ -49,6 +51,40 @@ def print_event(event: dict[str, Any]) -> None:
     elif event["type"] == "tool_call":
         args = f"({json.dumps(event['args'], ensure_ascii=False)})" if event.get("verbose") else ""
         print(f"  -> {event['tool']}{args}")
+    elif event["type"] == "model":
+        print(f"  [model: {event['model']} - {event['reason']}]")
+    elif event["type"] == "payment":
+        print_payments(event["items"])
+
+
+def print_payments(items: list[dict[str, Any]]) -> None:
+    """Show payment items in the terminal: UPI QR as text art, links as URLs, images in a viewer."""
+    import base64
+    import subprocess
+    import sys
+
+    import segno
+
+    from .store import DB_PATH
+
+    for item in items:
+        print("\n" + "=" * 60)
+        if item["kind"] == "upi":
+            amount = f"₹{item['amount_inr']:g}" if item.get("amount_inr") is not None else "amount not stated"
+            print(f"PAY WITH ANY UPI APP: {item.get('payee_name') or ''} <{item['payee_vpa']}>  {amount}")
+            segno.make(item["uri"], error="m").terminal(compact=True)
+        elif item["kind"] == "link":
+            print(f"PAYMENT LINK ({item['host']}): {item['url']}")
+        else:
+            path = DB_PATH.with_name("payment_qr." + item["src"].split(";")[0].split("/")[-1].replace("svg+xml", "svg"))
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(base64.b64decode(item["src"].split(",", 1)[1]))
+            print(f"PAYMENT QR saved to {path}")
+            if sys.platform == "darwin":
+                subprocess.run(["open", str(path)], check=False)
+        print("Check the payee and amount in your UPI app before entering your PIN.")
+        print("=" * 60)
 
 
 class OrderAgent:
@@ -81,9 +117,22 @@ class OrderAgent:
         if not allow_orders:
             self.system += "\nOrdering and booking are disabled in this session: analyse and browse only."
         self.usage = {"input": 0, "output": 0, "cache_read": 0}
+        # Per-run token accounting (one run = one send()): every API call and tool result.
+        self.on_usage: Callable[[dict[str, Any]], None] | None = None
+        self.usage_kind = "chat"
+        self.usage_label: str | None = None  # defaults to the user's message
+        self._run: dict[str, Any] | None = None
+        # Model routing (router.py): model and effort are chosen per run; `tier` is the
+        # conversation's current tier (only goes up under automatic routing).
+        self.router: Any = None
+        self.model_override: str | None = None  # "auto" | "haiku" | "sonnet" | "opus"
+        self.model, self.effort, self.tier = MODEL, EFFORT, None
         # When set to a list, every successful tool result is appended as
         # {"server", "tool", "text"} (used by the dish picker to read raw nutrition data).
         self.tool_log: list[dict[str, str]] | None = None
+        # Optional check on a tool call's arguments; a returned message refuses the call
+        # (the dish picker uses it to allow only the user's craving as a search keyword).
+        self.arg_guard: Callable[[BridgedTool, dict[str, Any]], str | None] | None = None
 
     def needs_approval(self, tool: BridgedTool) -> bool:
         # Fail closed: anything not known to be read-only (server annotation, or the config's
@@ -96,17 +145,18 @@ class OrderAgent:
 
     async def _create(self, output_format: dict[str, Any] | None, max_tokens: int):
         kwargs: dict[str, Any] = dict(
-            model=MODEL,
+            model=self.model,
             max_tokens=max_tokens,
             system=self.system,
             tools=self._tools(),
             messages=self.messages,
-            output_config={"effort": EFFORT, **({"format": output_format} if output_format else {})},
+            output_config={"effort": self.effort, **({"format": output_format} if output_format else {})},
             cache_control={"type": "ephemeral"},
-            # On a safety decline, the API retries the same request on a fallback model.
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
         )
+        if self.model.startswith("claude-opus"):
+            # On a safety decline, the API retries the same request on a fallback model
+            # (documented for Opus; Claude Haiku 5.5 has no server-side fallback).
+            kwargs.update(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
         if max_tokens <= 16000:
             return await self.client.beta.messages.create(**kwargs)
         # Large outputs: stream so the request doesn't hit HTTP timeouts.
@@ -120,6 +170,9 @@ class OrderAgent:
 
         if tool is None or (self.tool_filter is not None and not self.tool_filter(tool)):
             return {**result, "content": f"Unknown tool {block.name}", "is_error": True}
+        if self.arg_guard is not None and (refusal := self.arg_guard(tool, args)):
+            self.on_event({"type": "tool_declined", "tool": tool.label, "reason": refusal})
+            return {**result, "content": refusal, "is_error": True}
         if self.needs_approval(tool):
             if not self.allow_orders:
                 return {**result, "content": "Blocked: ordering is disabled in this session.", "is_error": True}
@@ -132,9 +185,14 @@ class OrderAgent:
         try:
             r = await self.mcp.call_ex(block.name, args)
             text, is_error, source = r.text, r.is_error, r.source
+            if r.payments:
+                self.on_event({"type": "payment", "tool": tool.label, "items": r.payments})
         except Exception as exc:  # surface MCP/transport failures to the model, don't crash the chat
             text, is_error = f"Tool call failed: {exc}", True
         self.on_event({"type": "tool_result", "tool": tool.label, "is_error": is_error, "chars": len(text), "source": source})
+        if self._run is not None:
+            self._run["tools"].append({"tool": tool.label, "chars": len(text), "source": source, "is_error": is_error,
+                                       "round": len(self._run["rounds"])})
         if self.tool_log is not None and not is_error:
             self.tool_log.append({"server": tool.server, "tool": tool.mcp_name, "text": text})
         return {**result, "content": text, "is_error": is_error}
@@ -143,9 +201,53 @@ class OrderAgent:
         self, user_text: str, *, output_format: dict[str, Any] | None = None, max_tokens: int = 16000
     ) -> str:
         """Send one user message, run tools until Claude finishes, return the final text."""
+        started = time.time()
+        if not self.messages:
+            self.tier = None  # new conversation: routing starts from the bottom again
+        decision = None
+        if self.router is not None:
+            decision = await self.router.choose(self.client, kind=self.usage_kind, text=user_text,
+                                                context=self._recent_context(), floor=self.tier,
+                                                override=self.model_override)
+            self.model, self.effort, self.tier = decision.model, decision.effort, decision.tier
+            self.on_event(decision.as_event())
+        self._run = {"kind": self.usage_kind, "label": (self.usage_label or user_text)[:200], "started_at": started,
+                     "model": self.model, "effort": self.effort, "tools_offered": len(self._tools()),
+                     "history_messages": len(self.messages), "rounds": [], "tools": [],
+                     **({"tier": decision.tier, "route_reason": decision.reason, "route_source": decision.source,
+                         "router": decision.usage} if decision else {})}
+        try:
+            return await self._send(user_text, output_format=output_format, max_tokens=max_tokens)
+        finally:
+            run, self._run = self._run, None
+            run["ms"] = round((time.time() - started) * 1000)
+            if self.on_usage is not None and (run["rounds"] or run.get("router")):
+                try:
+                    self.on_usage(run)
+                except Exception as exc:  # accounting must never break the chat
+                    print(f"warning: could not record token usage: {exc}", file=sys.stderr)
+
+    def _recent_context(self) -> str:
+        """Last few plain-text turns, for the router (tool calls and results left out)."""
+        parts: list[str] = []
+        for m in reversed(self.messages):
+            content = m["content"]
+            if isinstance(content, str):
+                parts.append(f"{m['role']}: {content[:500]}")
+            else:
+                text = " ".join(getattr(b, "text", "") or (b.get("text", "") if isinstance(b, dict) else "")
+                                for b in content if (getattr(b, "type", None) or (b.get("type") if isinstance(b, dict) else None)) == "text")
+                if text.strip():
+                    parts.append(f"{m['role']}: {text[:500]}")
+            if len(parts) >= 3:
+                break
+        return "\n".join(reversed(parts))
+
+    async def _send(self, user_text: str, *, output_format: dict[str, Any] | None, max_tokens: int) -> str:
         self.messages.append({"role": "user", "content": user_text})
 
         for _ in range(MAX_TOOL_ROUNDS):
+            t0 = time.time()
             try:
                 response = await self._create(output_format, max_tokens)
             except anthropic.AuthenticationError:
@@ -165,6 +267,14 @@ class OrderAgent:
             self.usage["input"] += u.input_tokens
             self.usage["output"] += u.output_tokens
             self.usage["cache_read"] += u.cache_read_input_tokens or 0
+            if self._run is not None:
+                self._run["rounds"].append({
+                    "model": getattr(response, "model", None) or MODEL,
+                    "input": u.input_tokens, "output": u.output_tokens,
+                    "cache_read": u.cache_read_input_tokens or 0, "cache_write": u.cache_creation_input_tokens or 0,
+                    "stop": response.stop_reason, "ms": round((time.time() - t0) * 1000),
+                    "tool_uses": [b.name for b in response.content if b.type == "tool_use"],
+                })
 
             # Keep the full content (thinking blocks included) so later turns stay valid.
             self.messages.append({"role": "assistant", "content": response.content})

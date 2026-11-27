@@ -54,6 +54,10 @@
         "-y",
         "mcp-remote@0.17.1",
         "https://mcp.zepto.co.in/mcp"
+      ],
+      "blockedTools": [
+        "create_upi_reserve_pay_order",
+        "create_wallet_order"
       ]
     },
     "blinkit-mcp": {
@@ -65,5 +69,6 @@
       "_note": "Local, unofficial: drives blinkit.com in a Chrome window (src/food_console/blinkit). Log in with `food-auth login --app blinkit`."
     }
   },
-  "_readOnlyTools": "readOnlyTools: for servers that don't label their tools (Zomato), the only tools that may run without asking. Anything not listed - including tools the server adds later - asks first. Servers that do label their tools (Swiggy) use their own labels and ignore this list."
+  "_readOnlyTools": "readOnlyTools: for servers that don't label their tools (Zomato), the only tools that may run without asking. Anything not listed - including tools the server adds later - asks first. Servers that do label their tools (Swiggy) use their own labels and ignore this list.",
+  "_blockedTools": "blockedTools: tools never offered to Claude or the Actions tab. Used for ways to pay without your UPI PIN (Zepto Cash wallet, UPI Reserve Pay mandate). Remove an entry to allow it; it will still ask for approval."
 }

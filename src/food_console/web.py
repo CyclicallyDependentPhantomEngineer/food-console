@@ -18,7 +18,7 @@ import secrets
 import sys
 import uuid
 import webbrowser
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -34,16 +34,19 @@ from starlette.routing import Route
 from . import _use_ant_profile
 from .agent import MODEL, OrderAgent
 from .store import Store
+from .router import Router, tier_of
+from .usage import PRICES, aggregate, summarize
 from .mcp_bridge import (
     DEFAULT_CONFIG,
     PROVIDERS,
     BridgedTool,
     MCPBridge,
+    load_blocked_tools,
     load_read_only_tools,
     load_server_params,
     normalize_schema,
 )
-from .nutrition import GOALS, SORTS, pick_dishes, pick_tool_filter, resolve_goal
+from .nutrition import ADDRESS_TOOLS, GOALS, SORTS, describe_address, parse_addresses, pick_dishes, pick_tool_filter, resolve_goal
 from .stats import (
     COMPARE_GROUPS,
     PLATFORMS,
@@ -76,6 +79,7 @@ class AppState:
         self.sessions: set[str] = set()
         self.mcp: MCPBridge | None = None
         self.store: Store | None = None
+        self.router = Router.from_env()
         self.chat: OrderAgent | None = None
         self.chat_lock = asyncio.Lock()
         self.stats_lock = asyncio.Lock()
@@ -110,10 +114,14 @@ class AppState:
         finally:
             self.pending.pop(approval_id, None)
 
-    def new_agent(self, **kwargs) -> OrderAgent:
+    def new_agent(self, *, kind: str = "chat", label: str | None = None, **kwargs) -> OrderAgent:
         assert self.mcp is not None
-        return OrderAgent(self.mcp, self.approve, provider=PROVIDERS["all"], profile=self.args.profile,
-                          on_event=self.emit, **kwargs)
+        agent = OrderAgent(self.mcp, self.approve, provider=PROVIDERS["all"], profile=self.args.profile,
+                           on_event=self.emit, **kwargs)
+        agent.usage_kind, agent.usage_label, agent.router = kind, label, self.router
+        if self.store is not None:
+            agent.on_usage = self.store.save_usage
+        return agent
 
 
 def _tool_info(t: BridgedTool, agent: OrderAgent) -> dict[str, Any]:
@@ -185,7 +193,9 @@ def build_app(state: AppState) -> Starlette:
     async def status(request: Request) -> Response:
         mcp = state.mcp
         return JSONResponse({
-            "model": MODEL,
+            "model": "auto routing" if state.router.enabled else state.router.off_model,
+            "router": {"enabled": state.router.enabled, "models": state.router.models,
+                       "classifier": state.router.classifier_model},
             "connected": list(mcp.sessions) if mcp else [],
             "failed": mcp.failed if mcp else {},
             "tool_count": len(mcp.tools) if mcp else 0,
@@ -214,23 +224,30 @@ def build_app(state: AppState) -> Starlette:
             return JSONResponse({"error": "args must be an object"}, status_code=400)
         if state.chat.needs_approval(tool) and body.get("confirm") is not True:
             return JSONResponse({"error": "confirmation required"}, status_code=409)
+        payments: list[dict[str, Any]] = []
         try:
             r = await state.mcp.call_ex(name, args)
-            text, is_error, source, cached_at = r.text, r.is_error, r.source, r.cached_at
+            text, is_error, source, cached_at, payments = r.text, r.is_error, r.source, r.cached_at, r.payments
         except Exception as exc:
             text, is_error, source, cached_at = f"Tool call failed: {exc}", True, "live", None
-        return JSONResponse({"result": text, "is_error": is_error, "source": source, "cached_at": cached_at})
+        return JSONResponse({"result": text, "is_error": is_error, "source": source, "cached_at": cached_at,
+                             "payments": payments})
 
     async def chat(request: Request) -> Response:
         assert state.chat
-        message = ((await request.json()).get("message") or "").strip()
+        body = await request.json()
+        message = (body.get("message") or "").strip()
         if not message:
             return JSONResponse({"error": "empty message"}, status_code=400)
+        choice = body.get("model") or "auto"
+        if tier_of(choice) is None:
+            return JSONResponse({"error": "model must be auto, haiku, sonnet or opus"}, status_code=400)
         if state.busy():
             return JSONResponse({"error": "busy: another request is running"}, status_code=409)
 
         async def work():
             async with state.chat_lock:
+                state.chat.model_override = choice
                 return {"text": await state.chat.send(message), "usage": state.chat.usage}
 
         return StreamingResponse(_stream(state, work), media_type="application/x-ndjson")
@@ -307,7 +324,8 @@ def build_app(state: AppState) -> Starlette:
         async def work():
             async with state.stats_lock:
                 # Fresh agent: read-only history tools only, so nothing can change the account.
-                agent = state.new_agent(tool_filter=history_tool_filter, allow_orders=False)
+                agent = state.new_agent(kind="stats", label="Stats refresh", tool_filter=history_tool_filter,
+                                        allow_orders=False)
                 fresh = await extract_orders(agent, limit=state.args.history_limit)
                 # Providers only return recent orders, so keep what earlier refreshes found.
                 data = merge_orders(load_orders(), fresh)
@@ -319,6 +337,37 @@ def build_app(state: AppState) -> Starlette:
     async def pick_last(request: Request) -> Response:
         return JSONResponse({"last": state.store.load_pick() if state.store else None,
                              "goals": GOALS, "sorts": SORTS, "platforms": list(PICK_PLATFORMS)})
+
+    async def _saved_addresses(servers: list[str]) -> tuple[list[dict[str, str]], dict[str, str]]:
+        """Saved addresses from each picker platform's read-only address tool (no Claude involved)."""
+        assert state.mcp
+        found: list[dict[str, str]] = []
+        problems: dict[str, str] = {}
+        for server in servers:
+            tool = next((name for name, t in state.mcp.tools.items()
+                         if t.server == server and t.mcp_name == ADDRESS_TOOLS.get(server) and t.read_only), None)
+            if tool is None:
+                problems[server] = "not connected"
+                continue
+            try:
+                r = await state.mcp.call_ex(tool, {})
+            except Exception as exc:
+                problems[server] = str(exc)[:200]
+                continue
+            if r.is_error:
+                problems[server] = r.text[:200]
+                continue
+            # A cached fallback is prefixed with a note line; the parser skips it.
+            parsed = parse_addresses(server, r.text.split("\n", 1)[1] if r.source == "cache-fallback" else r.text)
+            if not parsed:
+                problems[server] = "no saved addresses found"
+            found.extend(parsed)
+        return found, problems
+
+    async def pick_addresses(request: Request) -> Response:
+        servers = PICK_PLATFORMS["all"][0]
+        found, problems = await _saved_addresses(servers)
+        return JSONResponse({"addresses": found, "problems": problems})
 
     async def pick(request: Request) -> Response:
         if state.busy():
@@ -334,20 +383,46 @@ def build_app(state: AppState) -> Starlette:
         if platform not in PICK_PLATFORMS:
             return JSONResponse({"error": f"platform must be one of: {', '.join(PICK_PLATFORMS)}"}, status_code=400)
         query = str(body.get("query") or "")[:200]
-        address = str(body.get("address") or "")[:60]
         servers, names = PICK_PLATFORMS[platform]
+        address_detail, chosen = "", None
+        if body.get("address_id"):
+            # Only an address that really is in the user's saved list can be used (it goes into the prompt).
+            found, _ = await _saved_addresses([str(body.get("address_server") or "")])
+            chosen = next((a for a in found if a["id"] == str(body["address_id"])), None)
+            if chosen is None:
+                return JSONResponse({"error": "unknown address; reload the address list"}, status_code=400)
+            address_detail = describe_address(chosen, servers)
 
         async def work():
             async with state.pick_lock:
                 # Fresh agent restricted to read-only search/menu tools: it can't touch carts or orders.
-                agent = state.new_agent(tool_filter=pick_tool_filter(servers), allow_orders=False)
-                result = await pick_dishes(agent, goal, query=query, platforms=names, address=address)
+                label = " · ".join(x for x in ("Pick", goal["preset"], query, chosen["label"] if chosen else "") if x)
+                agent = state.new_agent(kind="pick", label=label, tool_filter=pick_tool_filter(servers), allow_orders=False)
+                result = await pick_dishes(agent, goal, query=query, platforms=names, address_detail=address_detail)
                 result["platform"] = platform
+                if chosen:
+                    result["address"] = {k: chosen[k] for k in ("server", "id", "label")}
                 if state.store:
                     state.store.save_pick(result)
                 return result
 
         return StreamingResponse(_stream(state, work), media_type="application/x-ndjson")
+
+    async def usage(request: Request) -> Response:
+        try:
+            start, end = _range(request)
+        except ValueError:
+            return JSONResponse({"error": "dates must be YYYY-MM-DD"}, status_code=400)
+        if state.store is None:
+            return JSONResponse({"runs": [], **aggregate([]), "prices": PRICES})
+        since = datetime.combine(start, datetime.min.time()).timestamp() if start else None
+        until = datetime.combine(end + timedelta(days=1), datetime.min.time()).timestamp() if end else None
+        runs = [summarize(r) for r in state.store.load_usage(since, until)]
+        return JSONResponse({"runs": runs, **aggregate(runs), "prices": PRICES})
+
+    async def usage_clear(request: Request) -> Response:
+        n = state.store.clear("usage") if state.store else 0
+        return JSONResponse({"cleared": n})
 
     allowed_hosts = {f"127.0.0.1:{state.args.port}", f"localhost:{state.args.port}"}
 
@@ -386,7 +461,10 @@ def build_app(state: AppState) -> Starlette:
             Route("/api/stats", stats),
             Route("/api/stats/refresh", stats_refresh, methods=["POST"]),
             Route("/api/stats/compare", stats_compare),
+            Route("/api/usage", usage),
+            Route("/api/usage/clear", usage_clear, methods=["POST"]),
             Route("/api/pick", pick_last),
+            Route("/api/pick/addresses", pick_addresses),
             Route("/api/pick", pick, methods=["POST"]),
         ],
         middleware=[Middleware(BaseHTTPMiddleware, dispatch=guard)],
@@ -427,13 +505,15 @@ async def _serve(args: argparse.Namespace) -> None:
     labels = {key: label for label, key in PROVIDERS["all"].servers}
     servers = [(labels.get(key, key), load_server_params(key, args.config)) for key in keys]
     read_only_tools = {labels.get(key, key): load_read_only_tools(key, args.config) for key in keys}
+    blocked_tools = {labels.get(key, key): load_blocked_tools(key, args.config) for key in keys}
 
     print("Connecting to MCP servers (first run opens a browser login per server) ...")
     print(f"mcp-remote logs: {LOG_DIR}")
     store = Store()
     print(f"Local cache: {store.path}")
     async with MCPBridge(servers, connect_timeout=args.connect_timeout, log_dir=LOG_DIR, require_any=False,
-                         store=store, cache_ttl=args.cache_ttl, read_only_tools=read_only_tools) as mcp:
+                         store=store, cache_ttl=args.cache_ttl, read_only_tools=read_only_tools,
+                         blocked_tools=blocked_tools) as mcp:
         state.mcp = mcp
         state.store = store
         state.chat = state.new_agent()
