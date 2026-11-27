@@ -104,6 +104,8 @@ macOS Keychain; the web UI is bound to `127.0.0.1` behind a one-time sign-in lin
 - **Works through rate limits.** Read-only answers are cached (encrypted); if a service is
   offline or throttling you, the last answer is shown and clearly marked as cached.
 - **Manual mode.** The Actions tab lets you run any tool yourself with a generated form.
+- **Voice input (optional).** Speak into the chat box; Whisper transcribes it on your own
+  computer and puts the text in the box for you to check before sending.
 
 ## Supported services
 
@@ -161,6 +163,7 @@ git clone https://github.com/<you>/food-console.git
 cd food-console
 uv sync
 npm ci --ignore-scripts
+uv sync --extra voice      # optional: voice input in the chat box (see Voice input)
 ```
 
 ### 2. Sign in to Claude
@@ -240,6 +243,34 @@ Example prompts:
 - "Compare milk, eggs and bread prices on Zepto and Instamart."
 - "Book a table for 4 on District this Saturday at 8."
 - "What movies are showing near me this weekend?"
+
+### Voice input
+
+Click the **microphone** next to Send, speak, and click it again (or wait for the
+60-second limit). The words appear in the chat box; check or edit them, then press Enter.
+Voice never sends or orders anything by itself, and every account change still needs your
+approval. **Esc** cancels a recording.
+
+Voice input is optional. Install it with `uv sync --extra voice` and restart `food-ui`;
+without it the microphone is greyed out.
+
+- **Private.** Audio goes only from the browser to `food-ui` on `127.0.0.1` and is
+  transcribed there with [faster-whisper](https://github.com/SYSTRAN/faster-whisper). It
+  is never stored or sent to Claude or anyone else; only the text you send is.
+- **First use** downloads the Whisper model once (the default `small` model is about
+  500 MB) into `~/.cache/huggingface`. After that it works offline.
+- **Accurate for Indian food words.** Whisper is told to expect service names, common
+  dishes (paneer, dal makhani, chole bhature…) and your most-ordered restaurants and dishes
+  from Stats, so it spells them right. In a test with macOS's Indian and US English voices, the
+  `small` model got 94% of key food words right (98% once a restaurant was in the order
+  history), in about 1.6 seconds per request on an M2 Pro.
+- **Language.** English by default, so Hindi dish names come out in Latin letters. Set
+  `FOOD_CONSOLE_WHISPER_LANGUAGE=auto` (or a code such as `hi`) to change it.
+- **Speed or accuracy.** `FOOD_CONSOLE_WHISPER_MODEL=large-v3-turbo` was slightly more
+  accurate (96% without history hints) but about 3× slower and a 1.6 GB download.
+  `FOOD_CONSOLE_WHISPER_DEVICE=mps` uses the Apple GPU (about 3× faster with `small`), but
+  that backend is experimental and crashed with `large-v3-turbo`, so the CPU is the default.
+- The browser asks for microphone permission the first time.
 
 ### Actions
 
@@ -625,6 +656,8 @@ after review cannot change the approved call.
 - Cache, saved orders, last pick and token-usage history: encrypted in `.cache/food.db`
   (see [Local cache](#local-cache)).
 - Logs: `.cache/logs/<server>.log` (request names, not personal data).
+- Voice recordings (optional voice input): transcribed in memory by a local Whisper model,
+  never written to disk or sent anywhere.
 
 ### What leaves your machine
 
@@ -727,6 +760,9 @@ uv run food-cache clear all --forget-key     # also delete the database and its 
 | `MCP_REMOTE_CONFIG_DIR` | `~/.mcp-auth` | Where `mcp-remote` keeps OAuth tokens |
 | `FOOD_CONSOLE_KEY_BACKEND` | Keychain | Set to `file` to keep the cache key in a file instead |
 | `BLINKIT_HEADLESS` | unset | `1` tries headless Chrome (usually blocked by Blinkit's bot check) |
+| `FOOD_CONSOLE_WHISPER_MODEL` | `small` | [Voice input](#voice-input) model (`base`, `small`, `medium`, `large-v3-turbo`, …) |
+| `FOOD_CONSOLE_WHISPER_DEVICE` | `cpu` | `mps` uses the Apple GPU (faster, experimental) |
+| `FOOD_CONSOLE_WHISPER_LANGUAGE` | `en` | Speech language; `auto` detects it |
 
 ### `mcp_config.json`
 
@@ -794,6 +830,9 @@ Haiku and Sonnet requests don't send it.
 | Blinkit results are for the wrong area | Set the location first (`select_address` or `set_location`); search results warn when none is set. |
 | Stats are empty | Click **Refresh from accounts**; Stats only shows what has been collected. |
 | Blinkit doesn't appear in `food-ui` | It is off by default; see [Enable Blinkit](#enable-blinkit). `food-ui` prints the services it skipped at startup. |
+| Microphone is greyed out | Voice input isn't installed: stop `food-ui`, run `uv sync --extra voice`, start it again. |
+| "Microphone blocked" | Allow the microphone for `127.0.0.1` in the browser's site settings (click the icon left of the address). |
+| Voice: "Didn't catch that" | No speech was detected. Speak closer to the mic; check the browser is using the right input device. |
 | `saved orders can't be decrypted` | The cache key changed or is missing. Run `food-cache clear orders` and refresh. |
 
 Service logs are in `.cache/logs/<server>.log`.
@@ -805,8 +844,8 @@ each service's app.
 ## Development
 
 ```bash
-uv sync
-uv run pytest -q          # 97 tests; no accounts or network needed (fake MCP servers)
+uv sync --extra voice
+uv run pytest -q          # 158 tests; no accounts or network needed (fake MCP servers)
 ```
 
 ### Project layout
@@ -824,6 +863,7 @@ src/food_console/
   credentials.py     account-change detection for private caches
   usage.py           token accounting per run: totals, cost at list prices, per-day, per-activity, per-model
   router.py          model routing: task routes, Haiku classifier, in-conversation ratchet
+  voice.py           optional voice input: local Whisper transcription and vocabulary hints
   web.py             web UI server (food-ui)
   static/index.html  web UI (single file, no external resources)
   blinkit/           unofficial Blinkit MCP server: parsers, encrypted session, Playwright driver
