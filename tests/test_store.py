@@ -8,6 +8,7 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
 from mcp import StdioServerParameters
 
 from food_console.mcp_bridge import MCPBridge
@@ -37,6 +38,60 @@ def test_legacy_json_is_imported_and_encrypted(tmp_path):
     s = Store(tmp_path / "food.db")
     assert s.load_orders()["orders"][0]["order_id"] == "9"
     assert not (tmp_path / "orders.json").exists()  # removed only after encrypted import
+
+
+@pytest.mark.parametrize("layout", ["master", "earlier-pr", "current"])
+def test_leftover_legacy_export_never_replaces_saved_history(tmp_path, layout):
+    path = tmp_path / "food.db"
+    saved = {"orders": [{"provider": "zomato", "service": "food", "order_id": str(i),
+                         "total_inr": 100 + i} for i in range(84)],
+             "notes": "keep these notes", "fetched_at": "current-history"}
+    s = Store(path)
+    s.save_orders(saved)
+    s.save_usage({"label": "keep usage"})
+    s.save_pick({"dish": "keep pick"})
+    if layout == "master":
+        s.db.execute("DROP TABLE credential_scope")
+        s.db.execute("DROP TABLE account_archives")
+    elif layout == "earlier-pr":
+        s.db.execute("DELETE FROM credential_scope WHERE slot=2")
+        s.db.execute("UPDATE credential_scope SET identity='old-token-hash' WHERE slot=1")
+    s.close()
+    legacy = tmp_path / "orders.json"
+    export = json.dumps({"orders": [{**o, "total_inr": 1} for o in saved["orders"][:2]],
+                         "notes": "stale export", "fetched_at": "old-history"}).encode()
+    legacy.write_bytes(export)
+    # Cover both the upgrade and subsequent ordinary startups.
+    for _ in range(2):
+        reopened = Store(path)
+        assert reopened.load_orders() == saved
+        assert reopened.load_usage()[0]["label"] == "keep usage"
+        assert reopened.load_pick() == {"dish": "keep pick"}
+        assert legacy.read_bytes() == export
+        reopened.close()
+
+
+def test_malformed_legacy_export_is_left_intact(tmp_path):
+    legacy = tmp_path / "orders.json"
+    legacy.write_text('{"orders":')
+    s = Store(tmp_path / "food.db")
+    assert s.load_orders() is None
+    assert legacy.read_text() == '{"orders":'
+    s.close()
+
+
+def test_leftover_export_is_not_imported_into_a_different_account(tmp_path):
+    path = tmp_path / "food.db"
+    s = Store(path, credential_source=lambda: "account-A")
+    s.save_orders({"orders": [{"provider": "zomato", "order_id": "private-A"}]})
+    s.close()
+    legacy = tmp_path / "orders.json"
+    legacy.write_text('{"orders": [{"order_id": "private-A"}]}')
+    original = legacy.read_bytes()
+    other = Store(path, credential_source=lambda: "account-B")
+    assert other.load_orders() is None
+    assert legacy.read_bytes() == original
+    other.close()
 
 
 def _flaky_server(tmp_path, mode_file):

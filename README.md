@@ -673,14 +673,17 @@ keychain is available. If the key is lost the cache is simply treated as empty. 
 
 - **Refreshes preserve your history.** Token bytes, expiry times, config formatting,
   read-only policies and enabling another service do not reset orders, usage or picks.
-  The first upgrade preserves existing encrypted history and imports legacy `orders.json`
-  before deleting the plaintext export. Only disposable, previously unscoped tool responses
+  The first upgrade preserves existing encrypted history. Legacy `orders.json` is imported
+  only when there are no saved orders or archived profiles, and deleted only after a successful
+  import. Otherwise the database and export remain intact. Only disposable, previously unscoped tool responses
   are refreshed on that upgrade.
 - **Account changes isolate private data.** A changed stable OAuth subject or an existing
   service’s credential directory/endpoint starts a new local account generation. A changed Blinkit phone number also starts a new generation. Explicit
   provider logout or `food-auth login --force` does the same. Previous private data is
   retained in encrypted `account_archives` in the database, not served to the new account;
   running sessions stop and require restart. `food-cache clear all` also deletes archives.
+  Forced re-login currently archives every service's history even for the same account;
+  those archives are not automatically restored on re-login or switching back.
   Opaque tokens cannot reveal which account owns them: switch those accounts through
   `food-auth logout` / `login --force`, rather than replacing token files manually. Separate
   installations remain the easiest way to keep independently accessible account histories.

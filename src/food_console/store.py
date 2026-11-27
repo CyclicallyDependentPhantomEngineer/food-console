@@ -160,10 +160,22 @@ class Store:
                 self.db.execute("INSERT OR REPLACE INTO credential_scope VALUES (2, 'stable-generation-v1')")
                 self.db.execute("DELETE FROM tool_results")  # refresh disposable, previously unscoped responses
         self._bind_identity(self._identity)
+        self._migrate_legacy_json()
+
+    def _migrate_legacy_json(self) -> None:
+        """Import an old export only when it cannot replace existing history."""
         legacy = self.path.with_name("orders.json")
-        if legacy.exists():
+        if (not legacy.exists()
+                or self.db.execute("SELECT 1 FROM orders_enc LIMIT 1").fetchone()
+                or self.db.execute("SELECT 1 FROM account_archives LIMIT 1").fetchone()):
+            # A skipped export stays intact. In particular, an empty new account
+            # must not inherit a leftover export belonging to an archived account.
+            return
+        try:
             self.save_orders(json.loads(legacy.read_text()))
-            legacy.unlink()  # only after successful encrypted import
+        except (OSError, ValueError):
+            return
+        legacy.unlink()  # only after successful encrypted import
 
     def _bind_identity(self, identity: str, *, expected: str | None = None) -> None:
         # Account switches archive private data; refreshes never arrive here.
