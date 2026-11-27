@@ -175,3 +175,34 @@ def test_district_provider_and_pick_excludes_it():
     assert ("district", "district-mcp") in PROVIDERS["all"].servers and SERVER_BRANDS["district"] == "District"
     keep = pick_tool_filter(["zomato", "food"])
     assert not keep(SimpleNamespace(mcp_name="search_restaurants", server="district", read_only=True))
+
+
+def test_merge_upserts_without_losing_history():
+    from food_console.stats import merge_orders
+
+    def o(oid, status="Delivered", **kw):
+        return {"provider": "swiggy", "service": "food", "order_id": oid, "placed_at": "2026-11-01T12:00:00",
+                "merchant": "M", "total_inr": 300, "status": status, **kw}
+
+    first = merge_orders(None, {"orders": [o("a", delivered_at="2026-11-01T12:30:00"), o("b")]})
+    # Next refresh: "a" fell out of Swiggy's window, "b" changed status without delivered_at, "c" is new.
+    second = merge_orders(first, {"orders": [o("b", status="Refunded"), o("c")]})
+    by = {x["order_id"]: x for x in second["orders"]}
+    assert set(by) == {"a", "b", "c"} and second["added"] == 1
+    assert by["a"]["delivered_at"] == "2026-11-01T12:30:00"     # old order kept
+    assert by["b"]["status"] == "Refunded"                         # newer value wins
+
+
+def test_merge_orders_without_ids_neither_duplicate_nor_collapse():
+    from food_console.stats import merge_orders
+
+    def noid(when, total):
+        return {"provider": "zepto", "service": "grocery", "order_id": "", "placed_at": when, "merchant": "Zepto",
+                "total_inr": total}
+
+    batch = {"orders": [noid("2026-11-01T10:00:00", 200), noid("2026-11-02T10:00:00", 350)]}
+    once = merge_orders(None, batch)
+    twice = merge_orders(once, batch)                    # same orders fetched again
+    assert len(once["orders"]) == 2 and len(twice["orders"]) == 2 and twice["added"] == 0
+    third = merge_orders(twice, {"orders": [noid("2026-11-03T10:00:00", 99)]})
+    assert len(third["orders"]) == 3                     # earlier id-less orders not collapsed

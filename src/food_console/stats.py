@@ -155,21 +155,41 @@ async def extract_orders(agent: OrderAgent, limit: int = 50) -> dict[str, Any]:
 
 
 def _key(o: dict[str, Any]) -> tuple[str, str, str]:
-    return (o.get("provider", ""), o.get("service", ""), str(o.get("order_id", "")))
+    """Identity of an order across refreshes: its id, or (without one) a content fingerprint."""
+    oid = str(o.get("order_id") or "").strip()
+    if not oid:
+        # No id: same service + time + place + amount is treated as the same order, so
+        # re-fetching it doesn't add a duplicate and distinct id-less orders don't collapse.
+        oid = "_noid|{}|{}|{}".format(o.get("placed_at") or "", (o.get("merchant") or "").strip().lower(),
+                                      o.get("total_inr") or 0)
+    return (o.get("provider", ""), o.get("service", ""), oid)
+
+
+def _empty(value: Any) -> bool:
+    return value in (None, "", 0, 0.0, [])
+
+
+def _combine(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+    """Newer values win (e.g. a status change), but a field the newer fetch left empty keeps
+    what an earlier refresh found (e.g. delivered_at, fees)."""
+    out = dict(old)
+    for k, v in new.items():
+        if not _empty(v) or k not in out:
+            out[k] = v
+    return out
 
 
 def merge_orders(old: dict[str, Any] | None, new: dict[str, Any]) -> dict[str, Any]:
-    """Keep orders from earlier refreshes (providers only return recent ones); newer copies win."""
+    """Upsert this refresh into the saved history. Providers only return recent orders, so
+    earlier ones are never dropped; the same order seen again is updated in place."""
     merged: dict[tuple[str, str, str], dict[str, Any]] = {}
     for o in (old or {}).get("orders", []):
         merged[_key(o)] = o
+    before = len(merged)
     for o in new.get("orders", []):
-        if not o.get("order_id"):  # no id: can't dedupe, keep as-is
-            merged[(o.get("provider", ""), o.get("service", ""), f"_{len(merged)}")] = o
-        else:
-            merged[_key(o)] = o
-    added = len(merged) - len((old or {}).get("orders", []))
-    return {**new, "orders": list(merged.values()), "added": max(0, added)}
+        k = _key(o)
+        merged[k] = _combine(merged[k], o) if k in merged else o
+    return {**new, "orders": list(merged.values()), "added": max(0, len(merged) - before)}
 
 
 def save_orders(data: dict[str, Any], path: Path | None = None) -> None:
