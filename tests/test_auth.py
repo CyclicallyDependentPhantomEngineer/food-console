@@ -139,3 +139,21 @@ def test_bridge_stops_orphan_left_by_failed_connect():
     except RuntimeError:
         pass  # no server connected - expected
     assert _wait_for(lambda: not remote_pids(url)), "orphaned mcp-remote was not stopped"
+
+
+def test_disabled_servers_are_left_out_of_defaults_only(tmp_path):
+    import json
+
+    from food_console.mcp_bridge import DEFAULT_CONFIG, default_keys, disabled_servers
+
+    # Blinkit (unofficial) ships disabled: not in "all", still available when named.
+    assert disabled_servers() == {"blinkit-mcp"}
+    assert "blinkit-mcp" not in [k for k, _ in auth._servers("all", DEFAULT_CONFIG)]
+    assert [k for k, _ in auth._servers("blinkit", DEFAULT_CONFIG)] == ["blinkit-mcp"]
+
+    cfg = json.loads(DEFAULT_CONFIG.read_text())
+    cfg["mcpServers"]["blinkit-mcp"]["disabled"] = False
+    cfg["mcpServers"]["zepto-mcp"]["disabled"] = True
+    path = tmp_path / "mcp_config.json"
+    path.write_text(json.dumps(cfg))
+    assert default_keys(["zomato-mcp", "zepto-mcp", "blinkit-mcp"], path) == ["zomato-mcp", "blinkit-mcp"]

@@ -106,6 +106,20 @@ def load_server_params(server: str, config_path: Path = DEFAULT_CONFIG) -> Stdio
     )
 
 
+def disabled_servers(config_path: Path = DEFAULT_CONFIG) -> set[str]:
+    """Servers marked `"disabled": true` in the config. They are left out of every default set
+    (food-ui, `--provider all`, `food-auth --app all`) but still run when named explicitly
+    (e.g. `--server blinkit-mcp`, `blinkit-chat`, `food-auth --app blinkit`)."""
+    config = json.loads(config_path.read_text())
+    return {key for key, entry in config["mcpServers"].items() if isinstance(entry, dict) and entry.get("disabled")}
+
+
+def default_keys(keys: list[str], config_path: Path = DEFAULT_CONFIG) -> list[str]:
+    """`keys` without the servers disabled in the config."""
+    off = disabled_servers(config_path)
+    return [k for k in keys if k not in off]
+
+
 def load_read_only_tools(server: str, config_path: Path = DEFAULT_CONFIG) -> set[str]:
     """The `readOnlyTools` allowlist for a server that doesn't label its tools (empty if none)."""
     config = json.loads(config_path.read_text())

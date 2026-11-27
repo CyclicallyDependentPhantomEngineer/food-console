@@ -3,6 +3,8 @@ name = "food-console"
 version = "0.1.0"
 description = "Chat with, act on and analyse your Zomato, Swiggy, District, Zepto and Blinkit accounts through Claude and their MCP servers"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [
     { name = "Soumok Dutta", email = "25546208+CyclicallyDependentPhantomEngineer@users.noreply.github.com" }
 ]

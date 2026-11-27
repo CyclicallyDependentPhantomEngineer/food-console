@@ -41,6 +41,7 @@ from .mcp_bridge import (
     PROVIDERS,
     BridgedTool,
     MCPBridge,
+    default_keys,
     load_blocked_tools,
     load_read_only_tools,
     load_server_params,
@@ -501,7 +502,12 @@ async def _auto_reconnect(mcp: MCPBridge, base: float = 120, cap: float = 900) -
 
 async def _serve(args: argparse.Namespace) -> None:
     state = AppState(args)
-    keys = args.server or [key for _, key in PROVIDERS["all"].servers]
+    every = [key for _, key in PROVIDERS["all"].servers]
+    keys = args.server or default_keys(every, args.config)
+    skipped = [k for k in every if k not in keys] if not args.server else []
+    if skipped:
+        print(f"Not started (\"disabled\": true in {args.config.name}): {', '.join(skipped)}. "
+              "Use --server to include one, or set \"disabled\": false.")
     labels = {key: label for label, key in PROVIDERS["all"].servers}
     servers = [(labels.get(key, key), load_server_params(key, args.config)) for key in keys]
     read_only_tools = {labels.get(key, key): load_read_only_tools(key, args.config) for key in keys}
