@@ -12,11 +12,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import copy
 import contextlib
+import hashlib
 import json
 import os
 import secrets
 import sys
+import time
 import uuid
 import webbrowser
 from datetime import date, datetime, timedelta
@@ -35,6 +39,7 @@ from starlette.routing import Route
 from . import _use_ant_profile
 from .agent import MODEL, OrderAgent
 from .store import Store
+from .credentials import AccountChanged, credential_fingerprint
 from .router import Router, tier_of
 from .usage import PRICES, aggregate, summarize
 from .mcp_bridge import (
@@ -64,6 +69,41 @@ from .stats import (
 
 STATIC = Path(__file__).with_name("static")
 SESSION_COOKIE = "food_console_session"
+SESSION_SECONDS = 8 * 3600
+APPROVAL_SECONDS = 120
+MAX_REQUEST_BYTES = 64_000
+
+
+class BodyLimitMiddleware:
+    """Bound streamed bodies too; Content-Length is not a trustworthy limit."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        chunks, size = [], 0
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            chunk = message.get("body", b"")
+            size += len(chunk)
+            if size > MAX_REQUEST_BYTES:
+                return await JSONResponse({"error": "request too large"}, status_code=413)(scope, receive, send)
+            chunks.append(chunk)
+            if not message.get("more_body", False):
+                break
+        delivered = False
+
+        async def bounded_receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": b"".join(chunks), "more_body": False}
+            return await receive()
+
+        await self.app(scope, bounded_receive, send)
 SIGNED_OUT_PAGE = """<!doctype html><meta charset="utf-8"><title>Food Console</title>
 <body style="font:15px system-ui;max-width:520px;margin:15vh auto;padding:0 20px;color:#222">
 <h2>Food Console</h2><p>{msg}</p>
@@ -78,7 +118,7 @@ class AppState:
         # left in browser history or shell scrollback can't be replayed.
         self.login_token = secrets.token_urlsafe(24)
         # Session ids handed out as HttpOnly, SameSite=Strict cookies.
-        self.sessions: set[str] = set()
+        self.sessions: dict[str, float] = {}
         self.mcp: MCPBridge | None = None
         self.store: Store | None = None
         self.router = Router.from_env()
@@ -87,6 +127,9 @@ class AppState:
         self.stats_lock = asyncio.Lock()
         self.pick_lock = asyncio.Lock()
         self.pending: dict[str, asyncio.Future[bool]] = {}
+        self.pending_sessions: dict[str, str] = {}
+        self.manual_approvals: dict[str, dict[str, Any]] = {}
+        self.work_tasks: dict[asyncio.Task, str] = {}
         # Event sink of the request currently streaming (one chat turn at a time).
         self.sink: asyncio.Queue | None = None
 
@@ -97,7 +140,21 @@ class AppState:
         return f"http://127.0.0.1:{self.args.port}/login?t={self.login_token}"
 
     def valid_session(self, sid: str) -> bool:
-        return any(secrets.compare_digest(sid, s) for s in self.sessions) if sid else False
+        for session, expires in list(self.sessions.items()):
+            if expires <= time.monotonic():
+                self.revoke(session)
+        return bool(sid and sid in self.sessions)
+
+    def revoke(self, sid: str) -> None:
+        self.sessions.pop(sid, None)
+        for key, owner in list(self.pending_sessions.items()):
+            fut = self.pending.get(key)
+            if owner == sid and fut is not None and not fut.done():
+                fut.set_result(False)
+        self.manual_approvals = {k: v for k, v in self.manual_approvals.items() if v["session"] != sid}
+        for task, owner in list(self.work_tasks.items()):
+            if owner == sid:
+                task.cancel()
 
     def emit(self, event: dict[str, Any]) -> None:
         if self.sink is not None:
@@ -107,6 +164,7 @@ class AppState:
         approval_id = uuid.uuid4().hex
         fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self.pending[approval_id] = fut
+        self.pending_sessions[approval_id] = self.work_tasks.get(asyncio.current_task(), "")
         self.emit({"type": "approval", "id": approval_id, "tool": tool.label, "args": args,
                    "description": (tool.tool.description or "")[:600]})
         try:
@@ -115,6 +173,7 @@ class AppState:
             return False
         finally:
             self.pending.pop(approval_id, None)
+            self.pending_sessions.pop(approval_id, None)
 
     def new_agent(self, *, kind: str = "chat", label: str | None = None, **kwargs) -> OrderAgent:
         assert self.mcp is not None
@@ -146,11 +205,15 @@ def _tool_info(t: BridgedTool, agent: OrderAgent) -> dict[str, Any]:
     }
 
 
-async def _stream(state: AppState, work) -> AsyncIterator[bytes]:
+async def _stream(state: AppState, work, session_id: str = "") -> AsyncIterator[bytes]:
     """Run `work()` while streaming its events as NDJSON; final line is {"type": "done", ...}."""
     queue: asyncio.Queue = asyncio.Queue()
     state.sink = queue
-    task = asyncio.create_task(work())
+    async def bounded_work():
+        async with asyncio.timeout(600):
+            return await work()
+    task = asyncio.create_task(bounded_work())
+    state.work_tasks[task] = session_id
     try:
         while True:
             getter = asyncio.create_task(queue.get())
@@ -169,22 +232,36 @@ async def _stream(state: AppState, work) -> AsyncIterator[bytes]:
             return
     finally:
         state.sink = None
+        state.work_tasks.pop(task, None)
         if not task.done():
             task.cancel()
 
 
 def build_app(state: AppState) -> Starlette:
+    # Authorize only the exact bundled inline script, not arbitrary inline code.
+    html = (STATIC / "index.html").read_text()
+    script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+    script_hash = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
+
     async def login(request: Request) -> Response:
         token = request.query_params.get("t", "")
         if not token or not secrets.compare_digest(token, state.login_token):
             return HTMLResponse(SIGNED_OUT_PAGE.format(
                 msg="This sign-in link was already used or is not valid."), status_code=403)
         sid = secrets.token_urlsafe(32)
-        state.sessions.add(sid)
+        state.sessions[sid] = time.monotonic() + SESSION_SECONDS
         state.login_token = secrets.token_urlsafe(24)
         print(f"A browser signed in. One-time link for another browser: {state.login_url()}")
         response = RedirectResponse("/", status_code=303)
-        response.set_cookie(SESSION_COOKIE, sid, httponly=True, samesite="strict", path="/")
+        response.set_cookie(SESSION_COOKIE, sid, httponly=True, samesite="strict", path="/", max_age=SESSION_SECONDS)
+        return response
+
+    async def logout_session(request: Request) -> Response:
+        state.revoke(request.cookies.get(SESSION_COOKIE, ""))
+        if state.chat:
+            state.chat.messages.clear()
+        response = JSONResponse({"ok": True})
+        response.delete_cookie(SESSION_COOKIE, path="/")
         return response
 
     async def index(request: Request) -> Response:
@@ -224,11 +301,26 @@ def build_app(state: AppState) -> Starlette:
         args = body.get("args") or {}
         if not isinstance(args, dict):
             return JSONResponse({"error": "args must be an object"}, status_code=400)
-        if state.chat.needs_approval(tool) and body.get("confirm") is not True:
-            return JSONResponse({"error": "confirmation required"}, status_code=409)
+        expected_tool = tool
+        if body.get("review") is True or body.get("approval_id") or state.chat.needs_approval(tool, args):
+            sid = request.cookies.get(SESSION_COOKIE, "")
+            now = time.monotonic()
+            state.manual_approvals = {k: v for k, v in state.manual_approvals.items() if v["expires"] > now}
+            if body.get("confirm") is not True:
+                if len(state.manual_approvals) >= 100:
+                    return JSONResponse({"error": "too many pending reviews"}, status_code=429)
+                approval_id = secrets.token_urlsafe(24)
+                state.manual_approvals[approval_id] = {"session": sid, "tool": tool, "args": copy.deepcopy(args),
+                                                     "expires": now + APPROVAL_SECONDS}
+                return JSONResponse({"error": "confirmation required", "approval_id": approval_id}, status_code=409)
+            record = state.manual_approvals.pop(body.get("approval_id", ""), None)
+            if (not record or record["session"] != sid or record["tool"] is not tool
+                    or json.dumps(record["args"], sort_keys=True) != json.dumps(args, sort_keys=True)):
+                return JSONResponse({"error": "review expired or changed; review the action again"}, status_code=409)
+            args, expected_tool = record["args"], record["tool"]
         payments: list[dict[str, Any]] = []
         try:
-            r = await state.mcp.call_ex(name, args)
+            r = await state.mcp.call_ex(name, args, expected_tool=expected_tool)
             text, is_error, source, cached_at, payments = r.text, r.is_error, r.source, r.cached_at, r.payments
         except Exception as exc:
             text, is_error, source, cached_at = f"Tool call failed: {exc}", True, "live", None
@@ -238,7 +330,10 @@ def build_app(state: AppState) -> Starlette:
     async def chat(request: Request) -> Response:
         assert state.chat
         body = await request.json()
-        message = (body.get("message") or "").strip()
+        message = body.get("message") or ""
+        if not isinstance(message, str):
+            return JSONResponse({"error": "message must be text"}, status_code=400)
+        message = message.strip()
         if not message:
             return JSONResponse({"error": "empty message"}, status_code=400)
         choice = body.get("model") or "auto"
@@ -252,19 +347,21 @@ def build_app(state: AppState) -> Starlette:
                 state.chat.model_override = choice
                 return {"text": await state.chat.send(message), "usage": state.chat.usage}
 
-        return StreamingResponse(_stream(state, work), media_type="application/x-ndjson")
+        return StreamingResponse(_stream(state, work, request.cookies.get(SESSION_COOKIE, "")), media_type="application/x-ndjson")
 
     async def chat_reset(request: Request) -> Response:
         assert state.chat
         if state.chat_lock.locked():
             return JSONResponse({"error": "busy"}, status_code=409)
         state.chat.messages.clear()
+        state.chat.mutation_uncertain = False
         return JSONResponse({"ok": True})
 
     async def approve(request: Request) -> Response:
         body = await request.json()
         fut = state.pending.get(body.get("id", ""))
-        if fut is None or fut.done():
+        if (fut is None or fut.done()
+                or state.pending_sessions.get(body.get("id", "")) != request.cookies.get(SESSION_COOKIE, "")):
             return JSONResponse({"error": "no such pending approval"}, status_code=404)
         fut.set_result(body.get("ok") is True)
         return JSONResponse({"ok": True})
@@ -295,7 +392,7 @@ def build_app(state: AppState) -> Starlette:
         except ValueError as exc:
             msg = str(exc) if "platform" in str(exc) else "dates must be YYYY-MM-DD"
             return JSONResponse({"error": msg}, status_code=400)
-        data = load_orders()
+        data = state.store.load_orders() if state.store else load_orders()
         if data is None:
             return JSONResponse({"orders": [], "all_count": 0, "metrics": None, "fetched_at": None, "notes": ""})
         return JSONResponse(_payload(data, start, end, platform))
@@ -308,7 +405,7 @@ def build_app(state: AppState) -> Starlette:
             start, end = _range(request)
         except ValueError:
             return JSONResponse({"error": "dates must be YYYY-MM-DD"}, status_code=400)
-        data = load_orders()
+        data = state.store.load_orders() if state.store else load_orders()
         if data is None:
             return JSONResponse({"segments": [], "orders": [], "all_count": 0, "fetched_at": None})
         return JSONResponse({"fetched_at": data.get("fetched_at"), "notes": data.get("notes", ""),
@@ -330,11 +427,11 @@ def build_app(state: AppState) -> Starlette:
                                         allow_orders=False)
                 fresh = await extract_orders(agent, limit=state.args.history_limit)
                 # Providers only return recent orders, so keep what earlier refreshes found.
-                data = merge_orders(load_orders(), fresh)
-                save_orders(data)
+                data = merge_orders(state.store.load_orders() if state.store else load_orders(), fresh)
+                state.store.save_orders(data) if state.store else save_orders(data)
                 return _payload(data, start, end, platform)
 
-        return StreamingResponse(_stream(state, work), media_type="application/x-ndjson")
+        return StreamingResponse(_stream(state, work, request.cookies.get(SESSION_COOKIE, "")), media_type="application/x-ndjson")
 
     async def pick_last(request: Request) -> Response:
         return JSONResponse({"last": state.store.load_pick() if state.store else None,
@@ -408,7 +505,7 @@ def build_app(state: AppState) -> Starlette:
                     state.store.save_pick(result)
                 return result
 
-        return StreamingResponse(_stream(state, work), media_type="application/x-ndjson")
+        return StreamingResponse(_stream(state, work, request.cookies.get(SESSION_COOKIE, "")), media_type="application/x-ndjson")
 
     async def usage(request: Request) -> Response:
         try:
@@ -438,14 +535,31 @@ def build_app(state: AppState) -> Starlette:
             # need a CORS preflight, which this server never approves (CSRF defence in depth).
             if request.headers.get("x-food-console") != "1":
                 return JSONResponse({"error": "missing X-Food-Console header"}, status_code=403)
+            if state.store is not None:
+                try:
+                    state.store.ensure_identity()
+                except AccountChanged as exc:
+                    for sid in list(state.sessions):
+                        state.revoke(sid)
+                    if state.chat:
+                        state.chat.messages.clear()
+                    return JSONResponse({"error": str(exc)}, status_code=409)
+            if request.method == "POST":
+                try:
+                    body = await request.json()
+                    if not isinstance(body, dict):
+                        raise ValueError("body must be an object")
+                    json.dumps(body, allow_nan=False)
+                except (ValueError, TypeError):
+                    return JSONResponse({"error": "body must be a JSON object with finite numbers"}, status_code=400)
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
+            f"default-src 'self'; script-src 'sha256-{script_hash}'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'"
         )
         return response
 
@@ -453,6 +567,7 @@ def build_app(state: AppState) -> Starlette:
         routes=[
             Route("/", index),
             Route("/login", login),
+            Route("/api/logout", logout_session, methods=["POST"]),
             Route("/api/status", status),
             Route("/api/tools", tools),
             Route("/api/reconnect", reconnect, methods=["POST"]),
@@ -469,7 +584,7 @@ def build_app(state: AppState) -> Starlette:
             Route("/api/pick/addresses", pick_addresses),
             Route("/api/pick", pick, methods=["POST"]),
         ],
-        middleware=[Middleware(BaseHTTPMiddleware, dispatch=guard)],
+        middleware=[Middleware(BodyLimitMiddleware), Middleware(BaseHTTPMiddleware, dispatch=guard)],
     )
 
 
@@ -513,14 +628,17 @@ async def _serve(args: argparse.Namespace) -> None:
     servers = [(labels.get(key, key), load_server_params(key, args.config)) for key in keys]
     read_only_tools = {labels.get(key, key): load_read_only_tools(key, args.config) for key in keys}
     blocked_tools = {labels.get(key, key): load_blocked_tools(key, args.config) for key in keys}
+    entries = json.loads(args.config.read_text())["mcpServers"]
+    operations = {labels.get(key, key): entries[key].get("readOnlyOperations", {}) for key in keys}
+    payments = {labels.get(key, key): entries[key].get("paymentTools", {}) for key in keys}
 
     print("Connecting to MCP servers (first run opens a browser login per server) ...")
     print(f"mcp-remote logs: {LOG_DIR}")
-    store = Store()
+    store = Store(credential_source=lambda: credential_fingerprint(args.config))
     print(f"Local cache: {store.path}")
     async with MCPBridge(servers, connect_timeout=args.connect_timeout, log_dir=LOG_DIR, require_any=False,
                          store=store, cache_ttl=args.cache_ttl, read_only_tools=read_only_tools,
-                         blocked_tools=blocked_tools) as mcp:
+                         blocked_tools=blocked_tools, read_only_operations=operations, payment_tools=payments) as mcp:
         state.mcp = mcp
         state.store = store
         state.chat = state.new_agent()

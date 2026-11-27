@@ -1,10 +1,9 @@
 {
   "mcpServers": {
     "zomato-mcp": {
-      "command": "npx",
+      "command": "node",
       "args": [
-        "-y",
-        "mcp-remote@0.17.1",
+        "${mcp_remote}",
         "https://mcp-server.zomato.com/mcp"
       ],
       "readOnlyTools": [
@@ -17,47 +16,99 @@
       ]
     },
     "swiggy-food": {
-      "command": "npx",
+      "command": "node",
       "args": [
-        "-y",
-        "mcp-remote@0.17.1",
+        "${mcp_remote}",
         "https://mcp.swiggy.com/food"
+      ],
+      "readOnlyTools": [
+        "fetch_food_coupons",
+        "get_addresses",
+        "get_food_cart",
+        "get_food_delivery_status",
+        "get_food_order_details",
+        "get_food_orders",
+        "get_payment_options",
+        "get_restaurant_menu",
+        "search_menu",
+        "search_restaurants",
+        "track_food_order"
       ]
     },
     "swiggy-instamart": {
-      "command": "npx",
+      "command": "node",
       "args": [
-        "-y",
-        "mcp-remote@0.17.1",
+        "${mcp_remote}",
         "https://mcp.swiggy.com/im"
+      ],
+      "readOnlyTools": [
+        "get_addresses",
+        "get_cart",
+        "get_delivery_status",
+        "get_orders",
+        "get_payment_options",
+        "search_products",
+        "track_order",
+        "your_go_to_items"
       ]
     },
     "swiggy-dineout": {
-      "command": "npx",
+      "command": "node",
       "args": [
-        "-y",
-        "mcp-remote@0.17.1",
+        "${mcp_remote}",
         "https://mcp.swiggy.com/dineout"
+      ],
+      "readOnlyTools": [
+        "get_available_slots",
+        "get_booking_status",
+        "get_payment_options",
+        "get_restaurant_details",
+        "search_restaurants_dineout"
       ]
     },
     "district-mcp": {
-      "command": "npx",
+      "command": "node",
       "args": [
-        "-y",
-        "mcp-remote@0.17.1",
+        "${mcp_remote}",
         "https://mcp-server.district.in/v2/mcp"
-      ]
+      ],
+      "readOnlyTools": [
+        "search",
+        "payment_options",
+        "payment_status"
+      ],
+      "readOnlyOperations": {
+        "execute": {
+          "argument": "operation",
+          "values": [
+            "consumer.booking_history"
+          ]
+        }
+      }
     },
     "zepto-mcp": {
-      "command": "npx",
+      "command": "node",
       "args": [
-        "-y",
-        "mcp-remote@0.17.1",
+        "${mcp_remote}",
         "https://mcp.zepto.co.in/mcp"
       ],
       "blockedTools": [
         "create_upi_reserve_pay_order",
         "create_wallet_order"
+      ],
+      "readOnlyTools": [
+        "check_payment_status",
+        "get_location_serviceability",
+        "get_order_detail",
+        "get_past_order_items",
+        "get_payment_methods",
+        "get_product_details",
+        "get_user_details",
+        "list_order_history",
+        "list_saved_addresses",
+        "search_multiple_products",
+        "search_products",
+        "view_cart"
       ]
     },
     "blinkit-mcp": {
@@ -67,10 +118,19 @@
         "-m",
         "food_console.blinkit.server"
       ],
-      "_note": "Unofficial: drives blinkit.com in a Chrome window (src/food_console/blinkit). Off by default (\"disabled\": true): food-ui and --provider all skip it; blinkit-chat, --server blinkit-mcp and food-auth --app blinkit still use it. Set \"disabled\": false to include it everywhere."
+      "_note": "Unofficial: drives blinkit.com in a Chrome window (src/food_console/blinkit). Off by default (\"disabled\": true): food-ui and --provider all skip it; blinkit-chat, --server blinkit-mcp and food-auth --app blinkit still use it. Set \"disabled\": false to include it everywhere.",
+      "readOnlyTools": [
+        "status",
+        "list_addresses",
+        "search",
+        "view_cart",
+        "order_history"
+      ]
     }
   },
-  "_readOnlyTools": "readOnlyTools: for servers that don't label their tools (Zomato), the only tools that may run without asking. Anything not listed - including tools the server adds later - asks first. Servers that do label their tools (Swiggy, District, Zepto, Blinkit) use their own labels and ignore this list.",
+  "_readOnlyTools": "Locally reviewed read-only tools. Remote annotations never grant approval exemptions. Unknown tools require approval.",
   "_disabled": "disabled: true leaves a server out of default sets (food-ui, --provider all, food-auth --app all); naming it explicitly still works.",
-  "_blockedTools": "blockedTools: tools never offered to Claude or the Actions tab. Used for ways to pay without your UPI PIN (Zepto Cash wallet, UPI Reserve Pay mandate). Remove an entry to allow it; it will still ask for approval."
+  "_blockedTools": "blockedTools: tools never offered to Claude or the Actions tab. Used for ways to pay without your UPI PIN (Zepto Cash wallet, UPI Reserve Pay mandate). Remove an entry to allow it; it will still ask for approval.",
+  "_readOnlyOperations": "Dispatch tools are read-only only for these exact operation argument values; all other operations require approval.",
+  "_paymentTools": "Optional reviewed structured UPI adapters: uriField and orderField paths, orderArgument, amountArgument, payeeArgument. No arbitrary text, images or opaque payment links are promoted to cards."
 }

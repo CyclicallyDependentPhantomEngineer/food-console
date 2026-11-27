@@ -1,3 +1,4 @@
+from conftest import FAKE_READ_ONLY
 """food-auth: app selection, status, logout, and login skipping servers already logged in."""
 import asyncio
 import hashlib
@@ -131,7 +132,7 @@ def test_bridge_stops_orphan_left_by_failed_connect():
     bad = StdioServerParameters(command=sys.executable, args=["-c", "import sys; sys.exit(1)"])
 
     async def run():
-        async with MCPBridge([("orphan", params), ("bad", bad)], connect_timeout=10):
+        async with MCPBridge([("orphan", params), ("bad", bad)], connect_timeout=10, read_only_tools=FAKE_READ_ONLY):
             pass
 
     try:

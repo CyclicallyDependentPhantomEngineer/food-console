@@ -11,6 +11,7 @@ the site changes, so every step reports what it actually saw instead of assuming
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import sys
@@ -19,6 +20,7 @@ from typing import Any
 
 from . import session
 from .parse import inr, parse_card_text, parse_history_detail, parse_history_summary, valid_product_id
+from ..payments import money
 
 HOME = "https://blinkit.com/"
 ORDERS = "https://blinkit.com/account/orders"
@@ -52,6 +54,7 @@ class Blinkit:
         self._pw = self._browser = self._context = self.page = None
         self.known: dict[str, dict[str, Any]] = {}  # product id -> last seen search info (incl. query)
         self.checkout_total: float | None = None  # total verified by the last checkout()
+        self.checkout_snapshot: str | None = None
 
     # ------------------------------------------------------------------ lifecycle
     async def start(self) -> None:
@@ -210,6 +213,7 @@ class Blinkit:
         return "Login not confirmed yet: the code may be wrong or expired. Check the Chrome window."
 
     async def logout(self) -> str:
+        self._cart_changed()
         session.clear(self.session_path)
         if self._context:
             await self._context.clear_cookies()
@@ -220,6 +224,7 @@ class Blinkit:
     def _cart_changed(self) -> None:
         """Anything that can change what is paid voids the total confirmed at checkout."""
         self.checkout_total = None
+        self.checkout_snapshot = None
 
     async def set_location(self, place: str) -> dict[str, Any]:
         self._cart_changed()
@@ -376,26 +381,42 @@ class Blinkit:
 
     async def _check_total(self, expected: float) -> dict[str, Any] | None:
         """Refuse to go on unless the cart total is what the user was shown."""
+        try:
+            approved = money(expected)
+        except ValueError:
+            return {"ok": False, "message": "Expected total must be a positive finite amount with at most two decimal places."}
         c = await self.cart()
         actual = c.get("total_inr")
         if actual is None:
             return {"ok": False, "message": "Could not read the cart total; call view_cart and try again.", "cart": c}
-        if abs(actual - float(expected)) > 1:
+        try:
+            matches = money(actual) == approved
+        except ValueError:
+            matches = False
+        if not matches:
             return {"ok": False, "message": f"Cart total is ₹{actual:g}, not ₹{expected:g}. Show the user the "
                     "current cart (view_cart) and get their OK on the new total before continuing.", "cart": c}
         return None
 
     async def checkout(self, expected_total_inr: float) -> dict[str, Any]:
+        self._cart_changed()
         if (refused := await self._check_total(expected_total_inr)):
             return refused
+        cart = await self.cart()
+        try:
+            if money(cart.get("total_inr")) != money(expected_total_inr) or not cart.get("items") or not cart.get("address"):
+                raise ValueError("incomplete cart")
+        except ValueError:
+            return {"ok": False, "message": "Could not verify the current cart and address. Review the cart again."}
         proceed = self.page.locator("button, div[role='button']").filter(has_text="Proceed").last
         if not await proceed.is_visible():
             return {"ok": False, "message": "No 'Proceed' button (cart empty, store unavailable, or login needed)."}
-        self.checkout_total = float(expected_total_inr)
         await proceed.click()
         await self.page.wait_for_timeout(3000)
         # A second Proceed appears after the address step on some carts.
         if await self._visible("#payment_widget"):
+            self.checkout_total = money(expected_total_inr)
+            self.checkout_snapshot = self._snapshot(cart)
             return {"ok": True, "message": "On the payment page. Ask the user how to pay: 'cod' or 'upi_qr'."}
         return {"ok": True, "message": "Checkout started; if Blinkit asks for an address, use list_addresses / "
                 "select_address, then call checkout again.", "location": await self.location()}
@@ -407,10 +428,24 @@ class Blinkit:
         if frame_el is None:
             return {"ok": False, "message": "Not on the payment page; call checkout first."}
         # The payment page hides the cart, so compare with the total checkout() verified.
-        if self.checkout_total is None or abs(self.checkout_total - float(expected_total_inr)) > 1:
+        try:
+            matches = self.checkout_total is not None and money(self.checkout_total) == money(expected_total_inr)
+        except ValueError:
+            matches = False
+        if not matches:
             return {"ok": False, "message": "expected_total_inr does not match the total confirmed at checkout "
                     f"({'none yet' if self.checkout_total is None else f'₹{self.checkout_total:g}'}). "
                     "Call view_cart and checkout again with the total the user approved."}
+        # A payment iframe alone does not prove the current cart is still approved.
+        # Fail closed when Blinkit hides the cart instead of trusting an old total.
+        current = await self.cart()
+        if self.checkout_snapshot is None or self._snapshot(current) != self.checkout_snapshot:
+            self._cart_changed()
+            return {"ok": False, "message": "Cart/address changed or could not be reverified. Review and checkout again, or finish in Chrome."}
+        frame_el = await self.page.query_selector("#payment_widget")
+        if frame_el is None:
+            self._cart_changed()
+            return {"ok": False, "message": "Payment page changed while checking the cart; review checkout again."}
         frame = await frame_el.content_frame()
         await frame.wait_for_load_state("networkidle")
         if payment == "cod":
@@ -427,8 +462,11 @@ class Blinkit:
                 pay = frame.locator("button, div[role='button']").filter(has_text="Place Order").last
             if not await pay.is_visible():
                 return {"ok": False, "message": "Selected cash, but no 'Pay Now' / 'Place Order' button was found."}
+            if not self._payment_amount_matches(await pay.inner_text(), expected_total_inr):
+                self._cart_changed()
+                return {"ok": False, "message": "The final payment amount could not be verified. Finish the order in Chrome."}
+            self._cart_changed()  # consume before dispatch, including timeout/unknown outcomes
             await pay.click()
-            self.checkout_total = None
             await self.page.wait_for_timeout(4000)
             return {"ok": True, "message": "Order placed with cash on delivery. Check order_history to confirm.",
                     "url": self.page.url}
@@ -441,17 +479,27 @@ class Blinkit:
         gen = frame.locator("button:has-text('Generate QR')").first
         if await gen.count() == 0:
             return {"ok": False, "message": "UPI opened, but no 'Generate QR' button was found."}
+        self._cart_changed()
         await gen.click()
-        self.checkout_total = None
         img = frame.locator("div[class*='QrImageWrapper'] img").first
         await img.wait_for(state="visible", timeout=10000)
         src = await img.get_attribute("src") or ""
         if not src.startswith("data:image/"):
             return {"ok": True, "message": "QR shown in the Chrome window: the user scans it with a UPI app to pay."}
-        # The app shows this image as a payment card (and strips it from what the model sees).
-        return {"ok": True, "message": "UPI QR generated and shown to the user (also visible in the Chrome window). "
-                "The order is placed once the user pays it in their UPI app; check order_history after.",
-                "qr_image": src}
+        # Opaque images cannot be bound to the approved payee/order/amount locally.
+        return {"ok": True, "message": "UPI QR is visible in Chrome. Verify the order, payee and amount there and in your UPI app; check order_history after paying."}
+
+    @staticmethod
+    def _snapshot(cart: dict[str, Any]) -> str:
+        return json.dumps({k: cart.get(k) for k in ("items", "address", "bill", "total_inr")}, sort_keys=True)
+
+    @staticmethod
+    def _payment_amount_matches(text: str, expected: float) -> bool:
+        amounts = re.findall(r"₹\s*([\d,]+(?:\.\d+)?)", text)
+        try:
+            return len(amounts) == 1 and money(amounts[0].replace(",", "")) == money(expected)
+        except ValueError:
+            return False
 
     # ------------------------------------------------------------------ history
     async def order_history(self, count: int = 10) -> dict[str, Any]:

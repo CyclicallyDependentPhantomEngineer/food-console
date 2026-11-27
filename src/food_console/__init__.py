@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from .agent import MODEL, OrderAgent, ask_yes_no
 from .router import Router
 from .store import Store
+from .credentials import AccountChanged, credential_fingerprint
 from .mcp_bridge import (
     DEFAULT_CONFIG,
     PROVIDERS,
@@ -120,6 +121,9 @@ async def _main(args: argparse.Namespace) -> int:
     servers = [(labels.get(key, key), load_server_params(key, args.config)) for key in keys]
     read_only_tools = {labels.get(key, key): load_read_only_tools(key, args.config) for key in keys}
     blocked_tools = {labels.get(key, key): load_blocked_tools(key, args.config) for key in keys}
+    entries = json.loads(args.config.read_text())["mcpServers"]
+    operations = {labels.get(key, key): entries[key].get("readOnlyOperations", {}) for key in keys}
+    payments = {labels.get(key, key): entries[key].get("paymentTools", {}) for key in keys}
 
     if args.command == "logout":
         return _logout(servers)
@@ -127,9 +131,9 @@ async def _main(args: argparse.Namespace) -> int:
     print(f"Connecting to {provider.brand}: {', '.join(label for label, _ in servers)} ...")
     print("First run opens a browser login per server; mcp-remote caches tokens in ~/.mcp-auth.")
 
-    store = Store()
+    store = Store(credential_source=lambda: credential_fingerprint(args.config))
     async with MCPBridge(servers, store=store, read_only_tools=read_only_tools,
-                         blocked_tools=blocked_tools) as mcp:
+                         blocked_tools=blocked_tools, read_only_operations=operations, payment_tools=payments) as mcp:
         agent = OrderAgent(
             mcp,
             _approve,
@@ -173,6 +177,7 @@ async def _main(args: argparse.Namespace) -> int:
                 continue
             if user == "/reset":
                 agent.messages.clear()
+                agent.mutation_uncertain = False
                 print("Conversation cleared.")
                 continue
             print("\nclaude> " + await agent.send(user))

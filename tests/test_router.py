@@ -78,7 +78,7 @@ def test_agent_sends_fallbacks_only_to_opus():
                                usage=SimpleNamespace(input_tokens=10, output_tokens=5, cache_read_input_tokens=0,
                                                      cache_creation_input_tokens=0))
 
-    agent = OrderAgent(SimpleNamespace(tools={}), approve=None, on_event=lambda e: None)
+    agent = OrderAgent(SimpleNamespace(tools={}, store=None), approve=None, on_event=lambda e: None)
     agent.client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(create=create)))
     for model in ("claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"):
         agent.model = model
@@ -96,7 +96,7 @@ def test_agent_routes_each_run_and_records_the_router_call():
                                                      cache_creation_input_tokens=0))
 
     events, runs = [], []
-    agent = OrderAgent(SimpleNamespace(tools={}), approve=None, on_event=events.append)
+    agent = OrderAgent(SimpleNamespace(tools={}, store=None), approve=None, on_event=events.append)
     agent.router, agent.on_usage = Router(), runs.append
     agent.client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(create=create)))
     asyncio.run(agent.send("list my addresses"))   # fake classifier echoes the requested model's tier? -> standard

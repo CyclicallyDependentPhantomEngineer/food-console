@@ -1,3 +1,4 @@
+from conftest import FAKE_READ_ONLY, PAYMENT_POLICY
 """Payment items: UPI links -> QR, images, payment links; only from account-changing tools."""
 import asyncio
 import sys
@@ -37,11 +38,11 @@ def test_links_images_and_unknown_hosts():
 
 def test_bridge_shows_payments_only_for_account_changing_tools_and_honours_blocked_tools():
     async def run():
-        async with MCPBridge([("pay", PAY)], blocked_tools={"pay": {"wallet_pay"}}) as mcp:
+        async with MCPBridge([("pay", PAY)], blocked_tools={"pay": {"wallet_pay"}}, read_only_tools=FAKE_READ_ONLY, payment_tools=PAYMENT_POLICY) as mcp:
             assert "wallet_pay" not in mcp.tools                            # blocked: not offered at all
-            order = await mcp.call_ex("place_order", {"amount": 412.5})
+            order = await mcp.call_ex("place_order", {"amount": 412.5, "order_id": "order-42", "payee": "merchant@okaxis"})
             kinds = sorted(i["kind"] for i in order.payments)
-            assert kinds == ["image", "upi"]
+            assert kinds == ["upi"]
             upi = next(i for i in order.payments if i["kind"] == "upi")
             assert upi["payee_vpa"] == "merchant@okaxis" and upi["amount_inr"] == 412.5
             assert "payment item(s)" in order.text
@@ -57,14 +58,14 @@ def test_agent_emits_payment_event():
     from food_console.agent import OrderAgent
 
     async def run():
-        async with MCPBridge([("pay", PAY)]) as mcp:
+        async with MCPBridge([("pay", PAY)], read_only_tools=FAKE_READ_ONLY, payment_tools=PAYMENT_POLICY) as mcp:
             events = []
 
             async def approve(tool, args):
                 return True
 
             agent = OrderAgent(mcp, approve, on_event=events.append)
-            await agent._run_tool(SimpleNamespace(id="t1", name="place_order", input={"amount": 99}))
+            await agent._run_tool(SimpleNamespace(id="t1", name="place_order", input={"amount": 99, "order_id": "order-42", "payee": "merchant@okaxis"}))
             pay = [e for e in events if e["type"] == "payment"]
             assert len(pay) == 1 and pay[0]["tool"] == "pay:place_order" and pay[0]["items"]
 
@@ -77,7 +78,7 @@ def test_agent_refuses_calls_the_arg_guard_rejects():
     from food_console.agent import OrderAgent
 
     async def run():
-        async with MCPBridge([("pay", PAY)]) as mcp:
+        async with MCPBridge([("pay", PAY)], read_only_tools=FAKE_READ_ONLY, payment_tools=PAYMENT_POLICY) as mcp:
             events = []
             agent = OrderAgent(mcp, approve=None, on_event=events.append)
             agent.arg_guard = lambda tool, args: "Refused: wrong keyword" if args.get("query") != "biryani" else None

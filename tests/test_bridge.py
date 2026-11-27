@@ -1,3 +1,4 @@
+from conftest import FAKE_READ_ONLY
 """Smoke tests: bridge + approval gate against fake MCP servers (no Claude API call)."""
 import asyncio
 import sys
@@ -21,7 +22,7 @@ def test_bridge_and_gate():
             asked.append(tool.mcp_name)
             return False
 
-        async with MCPBridge([("zomato", FAKE)]) as mcp:
+        async with MCPBridge([("zomato", FAKE)], read_only_tools=FAKE_READ_ONLY) as mcp:
             names = [t["name"] for t in mcp.claude_tools()]
             assert names == ["get_order_history", "payment_status", "place_order", "search_menu"]  # single server: no prefix
             agent = OrderAgent(mcp, deny)
@@ -47,7 +48,7 @@ def test_multi_server_prefixes_and_routes():
         async def allow(tool, args):
             return True
 
-        async with MCPBridge([("food", FAKE), ("instamart", FAKE), ("dineout", BROKEN)]) as mcp:
+        async with MCPBridge([("food", FAKE), ("instamart", FAKE), ("dineout", BROKEN)], read_only_tools=FAKE_READ_ONLY) as mcp:
             assert set(mcp.sessions) == {"food", "instamart"}  # broken server skipped, not fatal
             assert sorted(mcp.tools) == [
                 "food_get_order_history",
@@ -83,10 +84,10 @@ def test_read_only_only_from_annotations_or_allowlist():
     # Not listed -> asks, however harmless the name looks (no name-based trust any more).
     for n in ["create_cart", "checkout_cart", "bind_user_number", "get_new_tool_zomato_added_later"]:
         assert not bt(n).read_only, n
-    # A server that does annotate is trusted as-is; the allowlist doesn't override it.
-    assert not BridgedTool("s", "get_cart", "get_cart", types.Tool(name="get_cart", input_schema={"type": "object"},
+    # Local policy is authoritative, including when remote annotations disagree.
+    assert BridgedTool("s", "get_cart", "get_cart", types.Tool(name="get_cart", input_schema={"type": "object"},
                            annotations=types.ToolAnnotations(read_only_hint=False)), None, True).read_only
-    assert load_read_only_tools("swiggy-food") == set()
+    assert "get_addresses" in load_read_only_tools("swiggy-food")
 
 
 def test_rate_limit_reason_and_reconnect(tmp_path):
@@ -103,7 +104,7 @@ def test_rate_limit_reason_and_reconnect(tmp_path):
     )])
 
     async def run():
-        async with MCPBridge([("zomato", FAKE), ("food", flaky)], log_dir=tmp_path / "logs") as mcp:
+        async with MCPBridge([("zomato", FAKE), ("food", flaky)], log_dir=tmp_path / "logs", read_only_tools=FAKE_READ_ONLY) as mcp:
             assert set(mcp.sessions) == {"zomato"}
             assert "rate-limited" in mcp.failed["food"]
             assert "429" in (tmp_path / "logs" / "food.log").read_text()
@@ -121,7 +122,7 @@ def test_no_server_allowed_when_not_required(tmp_path):
     broken = StdioServerParameters(command=sys.executable, args=["-c", "import sys; sys.exit(1)"])
 
     async def run():
-        async with MCPBridge([("a", broken), ("b", broken)], log_dir=tmp_path, require_any=False) as mcp:
+        async with MCPBridge([("a", broken), ("b", broken)], log_dir=tmp_path, require_any=False, read_only_tools=FAKE_READ_ONLY) as mcp:
             assert not mcp.sessions and set(mcp.failed) == {"a", "b"} and mcp.tools == {}
 
     asyncio.run(run())
@@ -142,7 +143,7 @@ def test_every_non_read_only_tool_needs_approval():
                  bt("update_food_cart", write), bt("create_address", write), bt("apply_food_coupon", write)]:
         assert agent.needs_approval(tool), tool.mcp_name
     assert agent.needs_approval(bt("get_order_history"))  # not annotated, not allowlisted here
-    assert not agent.needs_approval(bt("get_addresses", types.ToolAnnotations(read_only_hint=True)))
+    assert agent.needs_approval(bt("get_addresses", types.ToolAnnotations(read_only_hint=True)))
     # Zepto labels its order tools "not destructive" with no read-only flag at all: still asks.
     no_ro_flag = types.ToolAnnotations(destructive_hint=False, open_world_hint=False)
     for name in ("create_order", "create_online_payment_order", "create_wallet_order", "select_saved_address"):
@@ -173,7 +174,7 @@ def test_log_and_cache_dirs_are_owner_only(tmp_path):
     broken = StdioServerParameters(command=sys.executable, args=["-c", "import sys; sys.exit(1)"])
 
     async def run():
-        async with MCPBridge([("a", broken), ("b", broken)], log_dir=tmp_path / "logs", require_any=False):
+        async with MCPBridge([("a", broken), ("b", broken)], log_dir=tmp_path / "logs", require_any=False, read_only_tools=FAKE_READ_ONLY):
             pass
 
     asyncio.run(run())

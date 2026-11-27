@@ -62,5 +62,8 @@ def has_login(state: dict[str, Any] | None) -> bool:
 def clear(path: Path = SESSION_PATH) -> bool:
     if path.exists():
         path.unlink()
+        if path == SESSION_PATH:
+            from ..store import clear_private_cache
+            clear_private_cache()
         return True
     return False

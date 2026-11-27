@@ -1,5 +1,6 @@
 """Fake payment server: an account-changing tool returning a UPI link and a QR image, and a
 read-only tool whose text happens to contain a UPI link (must never become a payment card)."""
+import json
 from mcp.server.mcpserver import MCPServer, Image
 from mcp.types import ToolAnnotations
 
@@ -8,10 +9,10 @@ PNG = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010806000000"
 
 
 @app.tool()
-def place_order(amount: float) -> list:
-    """Place an order (UPI)."""
-    return [f"status=PENDING_PAYMENT pay via tez://upi/pay?pa=merchant@okaxis&pn=Food%20Co&am={amount:.2f}&cu=INR&tn=Order%2042",
-            Image(data=PNG, format="png")]
+def place_order(amount: float, order_id: str, payee: str) -> dict:
+    """Place an order with structured payment metadata."""
+    return {"order_id": order_id, "payment": {"uri":
+        f"upi://pay?pa={payee}&pn=Food%20Co&am={amount:.2f}&cu=INR&tn={order_id}"}}
 
 
 @app.tool(annotations=ToolAnnotations(read_only_hint=True))

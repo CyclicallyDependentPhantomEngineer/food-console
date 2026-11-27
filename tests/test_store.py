@@ -1,3 +1,4 @@
+from conftest import FAKE_READ_ONLY
 """SQLite store and the bridge's cache behaviour (fresh hits, 429 fallback, offline tools, invalidation)."""
 import asyncio
 import json
@@ -30,12 +31,12 @@ def test_store_roundtrip_and_permissions(tmp_path):
     assert s.clear("orders") >= 1 and s.load_orders() is None
 
 
-def test_legacy_json_imported_once(tmp_path):
+def test_unscoped_legacy_json_is_discarded(tmp_path):
     (tmp_path / "orders.json").write_text(json.dumps({"orders": [{"provider": "zomato", "service": "food", "order_id": "9"}],
                                                       "fetched_at": "t"}))
     s = Store(tmp_path / "food.db")
-    assert [o["order_id"] for o in s.load_orders()["orders"]] == ["9"]
-    assert not (tmp_path / "orders.json").exists()  # plaintext copy removed once stored encrypted
+    assert s.load_orders() is None
+    assert not (tmp_path / "orders.json").exists()  # unscoped plaintext is not imported across accounts
 
 
 def _flaky_server(tmp_path, mode_file):
@@ -56,7 +57,7 @@ def test_cache_fresh_hit_fallback_and_invalidation(tmp_path):
     params = StdioServerParameters(command=sys.executable, args=[FAKE])
 
     async def run():
-        async with MCPBridge([("food", params), ("zomato", params)], store=db, cache_ttl=60) as mcp:
+        async with MCPBridge([("food", params), ("zomato", params)], store=db, cache_ttl=60, read_only_tools=FAKE_READ_ONLY) as mcp:
             first = await mcp.call_ex("food_get_order_history", {"limit": 1})
             assert first.source == "live" and "Biryani House" in first.text
             again = await mcp.call_ex("food_get_order_history", {"limit": 1})
@@ -92,11 +93,11 @@ def test_offline_server_tools_served_from_cache(tmp_path):
     down = StdioServerParameters(command=sys.executable, args=["-c", "import sys; sys.exit(1)"])
 
     async def first_run():  # both servers up: tool lists and a result get cached
-        async with MCPBridge([("food", good), ("zomato", good)], store=db) as mcp:
+        async with MCPBridge([("food", good), ("zomato", good)], store=db, read_only_tools=FAKE_READ_ONLY) as mcp:
             await mcp.call_ex("food_get_order_history", {})
 
     async def second_run():  # food is down (e.g. rate-limited at startup)
-        async with MCPBridge([("food", down), ("zomato", good)], store=db, log_dir=tmp_path / "logs") as mcp:
+        async with MCPBridge([("food", down), ("zomato", good)], store=db, log_dir=tmp_path / "logs", read_only_tools=FAKE_READ_ONLY) as mcp:
             assert "food" in mcp.failed
             assert mcp.tools["food_get_order_history"].offline          # read-only tool kept from cache
             assert "food_place_order" not in mcp.tools                   # account-changing tool hidden
@@ -144,8 +145,8 @@ def test_plaintext_v1_database_is_upgraded(tmp_path):
     db.execute("""INSERT INTO meta VALUES ('fetched_at', '"t"')""")
     db.commit(); db.close()
     s = Store(tmp_path / "food.db")
-    assert s.get_result("zomato", "get_order_history", {}).text == "SECRET-RESULT"
-    assert s.load_orders()["orders"][0]["merchant"] == "SECRET-PLACE"
+    assert s.get_result("zomato", "get_order_history", {}) is None
+    assert s.load_orders() is None
     s.close()
     raw = b"".join(p.read_bytes() for p in tmp_path.glob("food.db*") if not p.name.endswith(".key"))
     assert b"SECRET-RESULT" not in raw and b"SECRET-PLACE" not in raw
@@ -156,7 +157,7 @@ def test_status_tools_are_never_fresh_cache_hits(tmp_path):
     params = StdioServerParameters(command=sys.executable, args=[FAKE])
 
     async def run():
-        async with MCPBridge([("food", params)], store=db, cache_ttl=600) as mcp:
+        async with MCPBridge([("food", params)], store=db, cache_ttl=600, read_only_tools=FAKE_READ_ONLY) as mcp:
             first = await mcp.call_ex("payment_status", {})
             second = await mcp.call_ex("payment_status", {})
             # Polling sees the real change instead of a cached "pending".
