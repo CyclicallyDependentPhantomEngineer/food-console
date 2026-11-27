@@ -439,6 +439,7 @@ table.cmp tr:hover td { background: none; }
 .pickrow2 { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; margin-top: 14px; }
 .pickrow2 .seg { margin: 0; } .pickrow2 .seg button { padding: 6px 12px; font-size: 12.5px; }
 .pickrow2 select { width: auto; padding: 6px 10px; font-size: 13px; }
+.addrrow { display: flex; gap: 8px; } .addrrow select { flex: 1; min-width: 0; } .addrrow .btn { padding: 8px 12px; flex: none; }
 .pickrow2 .grow { flex: 1; }
 .pickfoot { font-size: 12px; color: var(--muted); margin-top: 10px; display: flex; gap: 6px; align-items: flex-start; }
 .dishes { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; margin-top: 16px; }
@@ -1613,12 +1614,14 @@ function ordersTable(orders) {
 
 // ---------- pick: what to order by calories and protein ----------
 let PICK_META = null, PICK_LOADED = false, PICK_LAST = null, PICK_ONLY_FITS = false;
-const PICK_DEFAULT_FORM = { goal: "lean", max_kcal: 650, min_protein: 30, max_price: "", diet: "any", platform: "all", sort: "density", query: "" };
+let ADDRS = null, ADDR_PROBLEMS = {};  // saved addresses per platform (null = loading)
+const PICK_DEFAULT_FORM = { goal: "lean", max_kcal: 650, min_protein: 30, max_price: "", diet: "any", platform: "all", sort: "density", query: "", address: "" };
 let PF = (() => { try { return { ...PICK_DEFAULT_FORM, ...JSON.parse(localStorage.getItem("pickForm") || "{}") }; } catch { return { ...PICK_DEFAULT_FORM }; } })();
 const savePF = () => { try { localStorage.setItem("pickForm", JSON.stringify(PF)); } catch {} };
 const MACRO_COLORS = { protein: "var(--ok)", carbs: "var(--accent2)", fat: "var(--instamart)" };
 const BRAND = { zomato: "Zomato", swiggy: "Swiggy", district: "District", zepto: "Zepto", blinkit: "Blinkit" };
-const goalDesc = g => [g.max_price ? `≤₹${g.max_price}` : null, g.max_kcal ? `≤${g.max_kcal} kcal` : null,
+const goalDesc = g => g.ignore_nutrition ? ["no calorie or protein limits", g.max_price ? `≤₹${g.max_price}` : null].filter(Boolean).join(" · ")
+  : [g.max_price ? `≤₹${g.max_price}` : null, g.max_kcal ? `≤${g.max_kcal} kcal` : null,
   g.min_protein ? `≥${g.min_protein} g protein` : null].filter(Boolean).join(" · ") || "no limits";
 function goTab(name) { document.querySelector(`.rail button[data-tab="${name}"]`).click(); }
 
@@ -1626,7 +1629,7 @@ async function loadPick() {
   PICK_LOADED = true;
   try {
     const r = await api("/api/pick"); const d = await r.json(); if (!r.ok) throw new Error(d.error);
-    PICK_META = d; renderPickForm();
+    PICK_META = d; renderPickForm(); loadAddresses();
     if (d.last) { PICK_LAST = d.last; renderPick(d.last, true); } else renderPickEmpty();
   } catch (e) { document.getElementById("pickform").replaceChildren(el("div", { class: "notes" }, icon("alert"), e.message)); }
 }
@@ -1647,12 +1650,15 @@ function renderPickForm() {
       PF.goal = k;
       if (!g.custom) Object.assign(PF, { max_kcal: g.max_kcal ?? "", min_protein: g.min_protein ?? "", max_price: g.max_price ?? "", sort: g.sort });
       savePF(); renderPickForm();
-    } }, el("b", {}, icon({ lean: "leaf", protein: "flame", light: "sparkles", value: "wallet", custom: "target" }[k] || "target", "width:15px;height:15px"), g.label),
+    } }, el("b", {}, icon({ lean: "leaf", protein: "flame", light: "sparkles", value: "wallet", treat: "heart", custom: "target" }[k] || "target", "width:15px;height:15px"), g.label),
       el("small", {}, g.custom ? "set your own limits" : goalDesc(g))));
   }
+  const treat = !!PICK_META.goals[PF.goal]?.ignore_nutrition;
   const num = (key, label, unit, placeholder) => {
-    const inp = el("input", { type: "number", min: "0", step: "1", value: PF[key] ?? "", placeholder, "aria-label": label,
-      oninput: e => { PF[key] = e.target.value === "" ? "" : Number(e.target.value); PF.goal = "custom"; savePF();
+    const ignored = treat && key !== "max_price";
+    const inp = el("input", { type: "number", min: "0", step: "1", value: ignored ? "" : (PF[key] ?? ""), placeholder: ignored ? "ignored for a treat" : placeholder,
+      "aria-label": label, disabled: ignored,
+      oninput: e => { PF[key] = e.target.value === "" ? "" : Number(e.target.value); if (treat) { savePF(); return; } PF.goal = "custom"; savePF();
         box.querySelectorAll(".goal").forEach((b, i) => b.classList.toggle("active", entries[i][0] === "custom")); } });
     return el("div", { class: "field" }, el("label", {}, label), el("div", { class: "inunit" }, inp, el("span", {}, unit)));
   };
@@ -1664,9 +1670,16 @@ function renderPickForm() {
   const sort = el("select", { "aria-label": "Rank by", onchange: e => { PF.sort = e.target.value; savePF(); if (PICK_LAST) renderPick(PICK_LAST); } },
     ...Object.entries(PICK_META.sorts).map(([v, label]) => el("option", { value: v, selected: PF.sort === v }, "Rank by: " + label)));
   const btn = el("button", { class: "btn primary", id: "pickgo", onclick: () => find() }, icon("search"), "Find dishes");
+  setTimeout(renderAddressSelect, 0);
   box.append(goals,
     el("div", { class: "pickfields" },
-      el("div", { class: "field wide" }, el("label", {}, "Craving (optional)"), query),
+      el("div", { class: "field wide" }, el("label", {}, "Craving (optional)"), query,
+        el("div", { class: "help" }, "If you enter one, only this is searched and only matching dishes are shown. Leave it empty to let Claude pick searches that suit your goal.")),
+      el("div", { class: "field wide" }, el("label", {}, icon("pin", "width:14px;height:14px"), "Deliver to"),
+        el("div", { class: "addrrow" },
+          el("select", { id: "pickaddr", "aria-label": "Delivery address", onchange: e => { PF.address = e.target.value; savePF(); } }),
+          el("button", { class: "btn ghost", title: "Reload saved addresses", onclick: () => loadAddresses() }, icon("refresh", "width:15px;height:15px"))),
+        el("div", { class: "help", id: "pickaddrinfo" })),
       num("max_kcal", "Max calories", "kcal", "no limit"), num("min_protein", "Min protein", "g", "none"), num("max_price", "Max price", "₹", "no limit")),
     el("div", { class: "pickrow2" },
       seg("diet", [["any", "Any"], ["veg", "Veg", "var(--ok)"], ["non_veg", "Non-veg", "var(--err)"]]),
@@ -1676,6 +1689,34 @@ function renderPickForm() {
       "Uses read-only search and menu tools only. Ordering happens in Chat, where every cart or checkout step asks you first."));
 }
 
+async function loadAddresses() {
+  ADDRS = null; renderAddressSelect();
+  try {
+    const r = await api("/api/pick/addresses"); const d = await r.json(); if (!r.ok) throw new Error(d.error);
+    ADDRS = d.addresses; ADDR_PROBLEMS = d.problems || {};
+  } catch (e) { ADDRS = []; ADDR_PROBLEMS = { all: e.message }; }
+  if (PF.address && !ADDRS.some(a => `${a.server}|${a.id}` === PF.address)) { PF.address = ""; savePF(); }
+  renderAddressSelect();
+}
+function renderAddressSelect() {
+  const sel = document.getElementById("pickaddr"), info = document.getElementById("pickaddrinfo");
+  if (!sel) return;
+  sel.replaceChildren(el("option", { value: "" }, ADDRS === null ? "Loading saved addresses…" : "Default (first saved address on each platform)"));
+  sel.disabled = ADDRS === null;
+  const groups = { zomato: "Zomato", food: "Swiggy" };
+  for (const [server, name] of Object.entries(groups)) {
+    const list = (ADDRS || []).filter(a => a.server === server);
+    if (!list.length) continue;
+    sel.append(el("optgroup", { label: name }, ...list.map(a => {
+      const text = a.text.length > 70 ? a.text.slice(0, 70) + "…" : a.text;
+      return el("option", { value: `${a.server}|${a.id}`, selected: PF.address === `${a.server}|${a.id}` }, `${a.label || "Unlabelled"} — ${text}`);
+    })));
+  }
+  const missing = Object.entries(ADDR_PROBLEMS).map(([k, v]) => `${{ zomato: "Zomato", food: "Swiggy", all: "Addresses" }[k] || k}: ${v}`);
+  info.textContent = ADDRS === null ? "" : missing.length ? missing.join(" · ")
+    : "The other platform's saved address at the same place is matched automatically.";
+}
+
 async function find() {
   const btn = document.getElementById("pickgo"), lg = document.getElementById("picklog");
   if (btn.disabled) return;
@@ -1683,6 +1724,7 @@ async function find() {
   lg.replaceChildren(el("span", { class: "spin" }), "Asking Claude to search menus…");
   const body = { goal: PF.goal, max_kcal: PF.max_kcal, min_protein: PF.min_protein, max_price: PF.max_price,
     diet: PF.diet, platform: PF.platform, sort: PF.sort, query: PF.query };
+  if (PF.address) { const i = PF.address.indexOf("|"); body.address_server = PF.address.slice(0, i); body.address_id = PF.address.slice(i + 1); }
   try {
     const r = await api("/api/pick", body);
     if (!r.ok) throw new Error((await r.json()).error);
@@ -1698,6 +1740,7 @@ async function find() {
 const PICK_SORT = {
   density: d => [d.protein_per_100kcal, d.protein_g], protein: d => [d.protein_g, d.protein_per_100kcal],
   kcal: d => [-d.kcal, d.protein_g], per_rupee: d => [d.protein_per_100inr, d.protein_per_100kcal],
+  rating: d => [d.rating || 0, -(d.price_inr || 0)], indulgent: d => [d.kcal, d.rating || 0],
 };
 function rerank(dishes, sort) {
   const key = PICK_SORT[sort] || PICK_SORT.density;
@@ -1719,8 +1762,10 @@ function scatter(dishes, goal) {
   const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Calories versus protein for each dish" });
   // target zone: at most max_kcal, at least min_protein
   const zx1 = x(goal.max_kcal || maxX), zy = y(goal.min_protein || 0);
-  svg.append(svgEl("rect", { x: L, y: T, width: zx1 - L, height: zy - T, rx: 8, fill: "var(--ok)", opacity: .1 }));
-  const zl = svgEl("text", { x: L + 8, y: T + 16, "font-size": 11, "font-weight": 700, fill: "var(--ok)" }); zl.textContent = "your target zone"; svg.append(zl);
+  if (!goal.ignore_nutrition) {
+    svg.append(svgEl("rect", { x: L, y: T, width: zx1 - L, height: zy - T, rx: 8, fill: "var(--ok)", opacity: .1 }));
+    const zl = svgEl("text", { x: L + 8, y: T + 16, "font-size": 11, "font-weight": 700, fill: "var(--ok)" }); zl.textContent = "your target zone"; svg.append(zl);
+  }
   const tick = (v, axis) => {
     if (axis === "x") { svg.append(svgEl("line", { x1: x(v), x2: x(v), y1: T, y2: H - B, stroke: "var(--line)" }));
       const t = svgEl("text", { x: x(v), y: H - B + 16, "text-anchor": "middle", "font-size": 10.5, fill: "var(--muted)" }); t.textContent = v; svg.append(t); }
@@ -1736,7 +1781,7 @@ function scatter(dishes, goal) {
     const c = PROVIDER_COLOR[d.provider] || "var(--accent)";
     const pt = svgEl("circle", { class: "pt", cx: x(d.kcal), cy: y(d.protein_g), r: d.fits ? 7 : 5.5, fill: c, "fill-opacity": d.fits ? .9 : .35,
       stroke: d.fits ? "var(--panel)" : c, "stroke-width": d.fits ? 2 : 1.2, "stroke-dasharray": d.source === "estimate" ? "2 2" : "" });
-    const tt = svgEl("title", {}); tt.textContent = `#${d.rank} ${d.dish} · ${d.merchant}\n${d.kcal} kcal · ${d.protein_g} g protein (${d.source === "listed" ? "listed" : "estimate"})`;
+    const tt = svgEl("title", {}); tt.textContent = `#${d.rank} ${d.dish} · ${d.merchant}${d.distance_km != null ? " · " + fmtKm(d.distance_km) : ""}\n${d.kcal} kcal · ${d.protein_g} g protein (${d.source === "listed" ? "listed" : "estimate"})`;
     pt.append(tt);
     pt.addEventListener("click", () => focusDish(d.rank));
     svg.append(pt);
@@ -1754,7 +1799,9 @@ function dishCard(d) {
   const pk = d.protein_g * 4, ck = d.carbs_g * 4, fk = d.fat_g * 9, tot = (pk + ck + fk) || 1;
   const share = v => Math.round(v * 100 / tot);
   const sub = el("div", { class: "sub" }, vegMark(d.veg), d.merchant,
-    d.rating ? el("span", {}, "★ " + d.rating) : null, d.eta ? el("span", {}, d.eta) : null);
+    d.rating ? el("span", {}, "★ " + d.rating) : null, d.eta ? el("span", {}, d.eta) : null,
+    d.distance_km != null ? el("span", { class: "dist", title: `Distance from ${PICK_ADDR_LABEL || "the delivery address"}, as stated by ${BRAND[d.provider] || d.provider}` },
+      icon("pin", "width:12px;height:12px"), fmtKm(d.distance_km) + (PICK_ADDR_LABEL ? ` from ${PICK_ADDR_LABEL}` : "")) : null);
   const listedNote = d.listed && d.listed_issues.length
     ? el("div", { class: "warnline" }, icon("alert"), el("div", {}, `Menu lists ${Math.round(d.listed.kcal)} kcal${d.listed.protein_g != null ? ` / ${d.listed.protein_g} g protein` : ""}, but ${d.listed_issues[0]}. Ranked on the estimate instead.`))
     : null;
@@ -1785,8 +1832,11 @@ function dishCard(d) {
       el("span", { class: "muted", style: { "font-size": "12px" } }, "you review the cart before anything is placed")));
 }
 
+let PICK_ADDR_LABEL = "";
+const fmtKm = km => km < 1 ? Math.round(km * 1000) + " m" : km.toFixed(1).replace(/\.0$/, "") + " km";
 function renderPick(d, isLast) {
   const body = document.getElementById("pickbody");
+  PICK_ADDR_LABEL = d.address?.label || d.address_label || "";
   const goal = d.goal || {};
   const dishes = rerank(d.dishes || [], PF.sort || goal.sort);
   if (!dishes.length) {
@@ -1801,18 +1851,21 @@ function renderPick(d, isLast) {
       el("div", { class: "v display" }, `${fits.length}/${dishes.length}`), el("div", { class: "l" }, "dishes fit your goal"),
       el("div", { class: "d" }, goalDesc(goal) + (goal.diet && goal.diet !== "any" ? " · " + goal.diet.replace("_", "-") : ""))),
     el("div", { class: "card kpi fade", style: { "--c": "var(--ok)" } }, el("div", { class: "ico" }, icon("flame")),
-      el("div", { class: "v display" }, Math.max(...dishes.map(x => x.protein_per_100kcal))), el("div", { class: "l" }, "best g protein / 100 kcal")),
+      el("div", { class: "v display" }, goal.ignore_nutrition ? "★ " + (Math.max(...dishes.map(x => x.rating || 0)) || "—") : Math.max(...dishes.map(x => x.protein_per_100kcal))),
+      el("div", { class: "l" }, goal.ignore_nutrition ? "best restaurant rating" : "best g protein / 100 kcal")),
     el("div", { class: "card kpi fade", style: { "--c": "var(--zomato)" } }, el("div", { class: "ico" }, icon("check")),
       el("div", { class: "v display" }, d.listed_count ?? dishes.filter(x => x.source === "listed").length), el("div", { class: "l" }, "with platform-listed nutrition"),
       el("div", { class: "d" }, "the rest are estimates")),
     el("div", { class: "card kpi fade", style: { "--c": "var(--accent)" } }, el("div", { class: "ico" }, icon("pin")),
-      el("div", { class: "v display", style: { "font-size": "20px" } }, d.address_label || "Default"), el("div", { class: "l" }, "delivery address"),
+      el("div", { class: "v display", style: { "font-size": "20px" } }, d.address?.label || d.address_label || "Default"),
+      el("div", { class: "l" }, (() => { const km = dishes.map(x => x.distance_km).filter(x => x != null);
+        return km.length ? `delivery address · nearest ${fmtKm(Math.min(...km))}, median ${fmtKm(km.sort((a, b) => a - b)[Math.floor(km.length / 2)])}` : "delivery address"; })()),
       el("div", { class: "d" }, (isLast ? "last search · " : "") + when)));
   const top = (fits.length ? fits : dishes).slice(0, 4);
   const bestPanel = el("div", { class: "card panel s5 fade" }, el("h3", {}, icon("trophy"), fits.length ? "Best picks" : "Closest options", el("small", {}, "by " + (PICK_META?.sorts?.[PF.sort] || "protein density").toLowerCase())),
     el("div", { class: "best" }, ...top.map((x, i) => el("button", { class: "bestrow", onclick: () => focusDish(x.rank) },
       el("span", { class: "medal", style: { "--c": i === 0 ? "var(--accent)" : PROVIDER_COLOR[x.provider] || "var(--accent)" } }, i + 1),
-      el("span", { class: "grow" }, el("b", {}, x.dish), el("small", {}, `${x.merchant} · ${x.price_inr ? inr(x.price_inr) : "—"}`)),
+      el("span", { class: "grow" }, el("b", {}, x.dish), el("small", {}, `${x.merchant} · ${x.price_inr ? inr(x.price_inr) : "—"}${x.distance_km != null ? " · " + fmtKm(x.distance_km) : ""}`)),
       el("span", { class: "num" }, `${Math.round(x.protein_g)} g`, el("small", {}, `${x.kcal} kcal`))))),
     fits.length ? null : el("div", { class: "note", style: { "margin-top": "12px" } }, icon("alert", "width:15px;height:15px;flex:none"), "Nothing met every limit. These come closest - try loosening one limit or another craving."));
   const plot = el("div", { class: "card panel s7 fade" }, el("h3", {}, icon("chart"), "Calories vs protein", el("small", {}, "solid = listed · dashed = estimate · click a dot")), scatter(dishes, goal));
@@ -1824,6 +1877,8 @@ function renderPick(d, isLast) {
     el("div", { class: "dishtools" }, el("h3", {}, icon("bowl"), "All dishes", el("span", { class: "tag" }, dishes.length)),
       el("span", { class: "grow" }), el("label", {}, only, "Only dishes that fit")),
     grid,
+    d.dropped_off_craving ? el("div", { class: "pickfoot", style: { "margin-top": "12px" } }, icon("search", "width:14px;height:14px;flex:none"),
+      d.dropped_off_craving + " dish" + (d.dropped_off_craving === 1 ? "" : "es") + " that didn't match \"" + d.query + "\" left out.") : null,
     d.notes ? el("div", { class: "card panel fade", style: { "margin-top": "16px" } }, el("div", { class: "notes" }, icon("alert", "color:var(--warn);margin-top:2px"), el("div", {}, el("b", {}, "Notes  "), d.notes))) : null,
     el("div", { class: "pickfoot", style: { "margin-top": "14px" } }, icon("alert", "width:14px;height:14px;flex:none"),
       "Estimates are for one serving as sold and can be off by 20–30%; listed values come from the platform's menu data and are checked for obvious errors. Not medical advice."));

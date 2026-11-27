@@ -92,7 +92,8 @@ async def _pick(mcp: MCPBridge, agent: OrderAgent, args: argparse.Namespace, bra
     for d in dishes:
         mark = "OK " if d["fits"] else "-- "
         src = "listed" if d["source"] == "listed" else "est."
-        print(f"{mark}{d['rank']:>2}. {d['dish']} - {d['merchant']} ({d['provider']})  Rs {d['price_inr']:.0f}")
+        km = f"  {d['distance_km']:g} km away" if d.get("distance_km") is not None else ""
+        print(f"{mark}{d['rank']:>2}. {d['dish']} - {d['merchant']} ({d['provider']})  Rs {d['price_inr']:.0f}{km}")
         print(f"      {d['kcal']} kcal  {d['protein_g']:.0f} g protein ({src})  "
               f"{d['protein_per_100kcal']} g/100 kcal  {d['protein_per_100inr']} g/Rs 100")
         if d["listed_issues"]:
@@ -203,14 +204,14 @@ def _run(default_provider: str) -> None:
     sub.add_parser("logout", help="delete the cached login tokens for the provider's servers on this machine")
     pick = sub.add_parser("pick", help="suggest what to order by calories and protein")
     pick.add_argument("query", nargs="*", help="what you feel like, e.g. chicken, south indian (optional)")
-    pick.add_argument("--goal", default="lean", choices=["lean", "protein", "light", "value", "custom"],
+    pick.add_argument("--goal", default="lean", choices=["lean", "protein", "light", "value", "treat", "custom"],
                       help="preset: lean (<=650 kcal, >=30 g), protein (>=40 g), light (<=450 kcal, >=15 g), "
-                           "value (<=Rs 300, >=25 g); explicit limits below override it")
+                           "value (<=Rs 300, >=25 g), treat (no calorie/protein limits); explicit limits below override it")
     pick.add_argument("--max-kcal", type=int)
     pick.add_argument("--min-protein", type=int)
     pick.add_argument("--max-price", type=int)
     pick.add_argument("--diet", default="any", choices=["any", "veg", "non_veg"])
-    pick.add_argument("--sort", choices=["density", "protein", "kcal", "per_rupee"])
+    pick.add_argument("--sort", choices=["density", "protein", "kcal", "per_rupee", "rating", "indulgent"])
     pick.add_argument("--address", help="saved address label to deliver to (default: the first)")
     pick.add_argument("--top", type=int, default=10, help="how many to show (default 10)")
     ask = sub.add_parser("ask", help="one-shot question, e.g. analysis")

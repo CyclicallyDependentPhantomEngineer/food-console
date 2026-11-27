@@ -116,6 +116,9 @@ class OrderAgent:
         # When set to a list, every successful tool result is appended as
         # {"server", "tool", "text"} (used by the dish picker to read raw nutrition data).
         self.tool_log: list[dict[str, str]] | None = None
+        # Optional check on a tool call's arguments; a returned message refuses the call
+        # (the dish picker uses it to allow only the user's craving as a search keyword).
+        self.arg_guard: Callable[[BridgedTool, dict[str, Any]], str | None] | None = None
 
     def needs_approval(self, tool: BridgedTool) -> bool:
         # Fail closed: anything not known to be read-only (server annotation, or the config's
@@ -152,6 +155,9 @@ class OrderAgent:
 
         if tool is None or (self.tool_filter is not None and not self.tool_filter(tool)):
             return {**result, "content": f"Unknown tool {block.name}", "is_error": True}
+        if self.arg_guard is not None and (refusal := self.arg_guard(tool, args)):
+            self.on_event({"type": "tool_declined", "tool": tool.label, "reason": refusal})
+            return {**result, "content": refusal, "is_error": True}
         if self.needs_approval(tool):
             if not self.allow_orders:
                 return {**result, "content": "Blocked: ordering is disabled in this session.", "is_error": True}

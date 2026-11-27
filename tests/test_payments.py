@@ -69,3 +69,21 @@ def test_agent_emits_payment_event():
             assert len(pay) == 1 and pay[0]["tool"] == "pay:place_order" and pay[0]["items"]
 
     asyncio.run(run())
+
+
+def test_agent_refuses_calls_the_arg_guard_rejects():
+    from types import SimpleNamespace
+
+    from food_console.agent import OrderAgent
+
+    async def run():
+        async with MCPBridge([("pay", PAY)]) as mcp:
+            events = []
+            agent = OrderAgent(mcp, approve=None, on_event=events.append)
+            agent.arg_guard = lambda tool, args: "Refused: wrong keyword" if args.get("query") != "biryani" else None
+            bad = await agent._run_tool(SimpleNamespace(id="t1", name="search", input={"query": "pizza"}))
+            ok = await agent._run_tool(SimpleNamespace(id="t2", name="search", input={"query": "biryani"}))
+            assert bad["is_error"] and bad["content"] == "Refused: wrong keyword"
+            assert not ok.get("is_error") and any(e["type"] == "tool_declined" for e in events)
+
+    asyncio.run(run())

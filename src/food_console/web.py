@@ -44,7 +44,7 @@ from .mcp_bridge import (
     load_server_params,
     normalize_schema,
 )
-from .nutrition import GOALS, SORTS, pick_dishes, pick_tool_filter, resolve_goal
+from .nutrition import ADDRESS_TOOLS, GOALS, SORTS, describe_address, parse_addresses, pick_dishes, pick_tool_filter, resolve_goal
 from .stats import (
     COMPARE_GROUPS,
     PLATFORMS,
@@ -323,6 +323,37 @@ def build_app(state: AppState) -> Starlette:
         return JSONResponse({"last": state.store.load_pick() if state.store else None,
                              "goals": GOALS, "sorts": SORTS, "platforms": list(PICK_PLATFORMS)})
 
+    async def _saved_addresses(servers: list[str]) -> tuple[list[dict[str, str]], dict[str, str]]:
+        """Saved addresses from each picker platform's read-only address tool (no Claude involved)."""
+        assert state.mcp
+        found: list[dict[str, str]] = []
+        problems: dict[str, str] = {}
+        for server in servers:
+            tool = next((name for name, t in state.mcp.tools.items()
+                         if t.server == server and t.mcp_name == ADDRESS_TOOLS.get(server) and t.read_only), None)
+            if tool is None:
+                problems[server] = "not connected"
+                continue
+            try:
+                r = await state.mcp.call_ex(tool, {})
+            except Exception as exc:
+                problems[server] = str(exc)[:200]
+                continue
+            if r.is_error:
+                problems[server] = r.text[:200]
+                continue
+            # A cached fallback is prefixed with a note line; the parser skips it.
+            parsed = parse_addresses(server, r.text.split("\n", 1)[1] if r.source == "cache-fallback" else r.text)
+            if not parsed:
+                problems[server] = "no saved addresses found"
+            found.extend(parsed)
+        return found, problems
+
+    async def pick_addresses(request: Request) -> Response:
+        servers = PICK_PLATFORMS["all"][0]
+        found, problems = await _saved_addresses(servers)
+        return JSONResponse({"addresses": found, "problems": problems})
+
     async def pick(request: Request) -> Response:
         if state.busy():
             return JSONResponse({"error": "busy: another request is running"}, status_code=409)
@@ -337,15 +368,24 @@ def build_app(state: AppState) -> Starlette:
         if platform not in PICK_PLATFORMS:
             return JSONResponse({"error": f"platform must be one of: {', '.join(PICK_PLATFORMS)}"}, status_code=400)
         query = str(body.get("query") or "")[:200]
-        address = str(body.get("address") or "")[:60]
         servers, names = PICK_PLATFORMS[platform]
+        address_detail, chosen = "", None
+        if body.get("address_id"):
+            # Only an address that really is in the user's saved list can be used (it goes into the prompt).
+            found, _ = await _saved_addresses([str(body.get("address_server") or "")])
+            chosen = next((a for a in found if a["id"] == str(body["address_id"])), None)
+            if chosen is None:
+                return JSONResponse({"error": "unknown address; reload the address list"}, status_code=400)
+            address_detail = describe_address(chosen, servers)
 
         async def work():
             async with state.pick_lock:
                 # Fresh agent restricted to read-only search/menu tools: it can't touch carts or orders.
                 agent = state.new_agent(tool_filter=pick_tool_filter(servers), allow_orders=False)
-                result = await pick_dishes(agent, goal, query=query, platforms=names, address=address)
+                result = await pick_dishes(agent, goal, query=query, platforms=names, address_detail=address_detail)
                 result["platform"] = platform
+                if chosen:
+                    result["address"] = {k: chosen[k] for k in ("server", "id", "label")}
                 if state.store:
                     state.store.save_pick(result)
                 return result
@@ -390,6 +430,7 @@ def build_app(state: AppState) -> Starlette:
             Route("/api/stats/refresh", stats_refresh, methods=["POST"]),
             Route("/api/stats/compare", stats_compare),
             Route("/api/pick", pick_last),
+            Route("/api/pick/addresses", pick_addresses),
             Route("/api/pick", pick, methods=["POST"]),
         ],
         middleware=[Middleware(BaseHTTPMiddleware, dispatch=guard)],

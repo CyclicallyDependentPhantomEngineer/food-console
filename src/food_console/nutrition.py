@@ -26,6 +26,8 @@ SORTS = {
     "protein": "Most protein",
     "kcal": "Fewest calories",
     "per_rupee": "Protein per ₹100",
+    "rating": "Best rated",
+    "indulgent": "Most indulgent",
 }
 DIETS = ("any", "veg", "non_veg")
 
@@ -35,6 +37,8 @@ GOALS: dict[str, dict[str, Any]] = {
     "protein": {"label": "Max protein", "max_kcal": None, "min_protein": 40, "sort": "protein"},
     "light": {"label": "Light meal", "max_kcal": 450, "min_protein": 15, "sort": "kcal"},
     "value": {"label": "Protein on a budget", "max_kcal": 800, "min_protein": 25, "sort": "per_rupee", "max_price": 300},
+    # No calorie or protein limits at all (any given are ignored); price and diet still apply.
+    "treat": {"label": "Treat yourself", "max_kcal": None, "min_protein": None, "sort": "rating", "ignore_nutrition": True},
 }
 
 DISH_SCHEMA: dict[str, Any] = {
@@ -59,6 +63,10 @@ DISH_SCHEMA: dict[str, Any] = {
                     "veg": {"type": "string", "enum": ["veg", "non_veg", "unknown"]},
                     "rating": {"type": "number", "description": "Restaurant rating; 0 if unknown"},
                     "eta": {"type": "string", "description": "Delivery time as returned, or empty"},
+                    "distance_km": {
+                        "type": "number",
+                        "description": "Restaurant distance from the delivery address as the tool states it (km); -1 if not stated",
+                    },
                     "portion": {"type": "string", "description": "What one order contains, e.g. '6 pc tikka + mint chutney'"},
                     "est_kcal": {"type": "number", "description": "Your estimate for one order as sold"},
                     "est_protein_g": {"type": "number"},
@@ -67,10 +75,14 @@ DISH_SCHEMA: dict[str, Any] = {
                     "listed_kcal": {"type": "number", "description": "Calories the tool result states for this dish, copied exactly; -1 if none"},
                     "listed_protein_g": {"type": "number", "description": "Protein the tool result states, copied exactly; -1 if none"},
                     "why": {"type": "string", "description": "One short line: why it suits the goal, or the catch"},
+                    "matches_craving": {
+                        "type": "boolean",
+                        "description": "True if the dish is what the user asked for (the craving); true when there is no craving",
+                    },
                 },
                 "required": [
                     "provider", "service", "merchant", "merchant_id", "dish", "item_id", "price_inr", "veg", "rating",
-                    "eta", "portion", "est_kcal", "est_protein_g", "est_carbs_g", "est_fat_g", "listed_kcal",
+                    "eta", "distance_km", "portion", "matches_craving", "est_kcal", "est_protein_g", "est_carbs_g", "est_fat_g", "listed_kcal",
                     "listed_protein_g", "why",
                 ],
                 "additionalProperties": False,
@@ -92,13 +104,11 @@ Platforms to search: {platforms}
 
 How to search:
 - Get the saved addresses first and use {address}. Pass its address id to every search and menu call.
-- Search with 2-4 keywords that fit both the craving and the goal (for protein: grilled/tandoori \
-chicken, kebabs, tikka, egg, fish, paneer, soya, protein bowls, salads with protein, ...). Ask for \
-up to 10 results per page. Skip restaurants that are not serviceable right now.
+{search_rule} Ask for up to 10 results per page. Skip restaurants that are not serviceable right now.
 - For the 3-5 most promising restaurants, read the menu to find better fits (Zomato: \
 get_menu_items_listing with address_id; many dishes include health_info).
 - Return up to {limit} dishes from several restaurants: mostly ones likely to fit the goal, plus a \
-few near misses if not many fit.
+few near misses if not many fit.{craving_rule}
 
 For every dish:
 - Copy names, ids and prices exactly from tool results. item_id is what adds it to a cart \
@@ -118,6 +128,48 @@ matches, filters you could not apply). Don't repeat numbers or rankings there.""
 _NOT_FOR_PICKING = re.compile(r"order|history|track|booking|coupon|cart|payment|status|otp", re.I)
 
 
+# Arguments that carry a search keyword in the picker's search tools
+# (Zomato get_restaurants_for_keyword.keyword, Swiggy search_restaurants.query / search_menu.query).
+SEARCH_ARGS = ("keyword", "query", "q", "search", "searchTerm", "search_query")
+
+
+def _norm(text: str) -> str:
+    return " ".join(re.sub(r"[^\w\s]", " ", (text or "").lower()).split())
+
+
+def search_rule(query: str, goal: dict[str, Any] | None = None) -> str:
+    if query.strip():
+        return (f'- Search ONLY for exactly "{query.strip()}": pass exactly that text as the keyword/query of every '
+                "search call - no other keywords, no extra words, no synonyms, no searches without a keyword. "
+                "Any other search is refused. Menus may be read only for restaurants that search returned.")
+    if goal and goal.get("ignore_nutrition"):
+        return ("- Search with 2-4 keywords for indulgent comfort food (pizza, burgers, biryani, fried chicken, "
+                "shawarma, loaded fries, desserts, shakes, ...) from well-rated restaurants.")
+    return ("- Search with 2-4 keywords that suit the goal (for protein: grilled/tandoori chicken, kebabs, tikka, "
+            "egg, fish, paneer, soya, protein bowls, salads with protein, ...).")
+
+
+def craving_guard(query: str):
+    """Refuse any search call whose keyword isn't exactly the craving (case and punctuation aside)."""
+    want = _norm(query)
+
+    def guard(tool: BridgedTool, args: dict[str, Any]) -> str | None:
+        props = ((tool.tool.input_schema or {}).get("properties") or {})
+        keys = [k for k in SEARCH_ARGS if k in props]
+        if not keys:
+            return None  # not a search tool (addresses, menus by restaurant id, ...)
+        given = [str(args.get(k) or "") for k in keys if args.get(k) not in (None, "")]
+        if not given:
+            return f'Refused: searches must use exactly the keyword "{query.strip()}".'
+        bad = [g for g in given if _norm(g) != want]
+        if bad:
+            return (f'Refused: only "{query.strip()}" may be searched (got {bad[0]!r}). '
+                    "Repeat the search with exactly that keyword.")
+        return None
+
+    return guard
+
+
 def pick_tool_filter(servers: Iterable[str] | None = None):
     allowed = set(servers) if servers else None
 
@@ -127,6 +179,45 @@ def pick_tool_filter(servers: Iterable[str] | None = None):
         return allowed is None or tool.server in allowed
 
     return keep
+
+
+# ---------------------------------------------------------------- saved addresses
+
+# Read-only tool that lists saved addresses, per picker server.
+ADDRESS_TOOLS = {"zomato": "get_saved_addresses_for_user", "food": "get_addresses"}
+_SWIGGY_ADDRESS = re.compile(
+    r"^\s*\d+\.\s*\[(?P<label>[^\]]*)\]\s*(?P<name>[^:\n]*):\s*(?P<text>.*?)\s*\(id:\s*(?P<id>[^)\s]+)\)\s*$",
+    re.I | re.M,
+)
+
+
+def parse_addresses(server: str, text: str) -> list[dict[str, str]]:
+    """Saved addresses from a platform's address tool: [{server, id, label, text}]."""
+    out: list[dict[str, str]] = []
+    data = _json_of(text)
+    if isinstance(data, dict) and isinstance(data.get("addresses"), list):  # Zomato
+        for a in data["addresses"]:
+            if isinstance(a, dict) and a.get("address_id"):
+                out.append({"server": server, "id": str(a["address_id"]), "label": str(a.get("label") or "").strip(),
+                            "text": str(a.get("location_name") or a.get("address") or "").strip()})
+        return out
+    for m in _SWIGGY_ADDRESS.finditer(text or ""):  # Swiggy: "1. [label] Name: address (id: X)"
+        out.append({"server": server, "id": m.group("id"), "label": m.group("label").strip(),
+                    "text": m.group("text").strip()})
+    return out
+
+
+def describe_address(chosen: dict[str, str], servers: Iterable[str]) -> str:
+    """Prompt text that pins the delivery address chosen in the UI."""
+    names = {"zomato": "Zomato", "food": "Swiggy Food"}
+    where = f'"{chosen["label"]}" ({chosen["text"]})' if chosen.get("text") else f'"{chosen["label"]}"'
+    others = [names.get(s, s) for s in servers if s != chosen["server"]]
+    hint = (f"the saved address {where}; on {names.get(chosen['server'], chosen['server'])} its address id is "
+            f"{chosen['id']} - use exactly that id")
+    if others:
+        hint += (f". On {', '.join(others)}, use the saved address at the same location (match the building "
+                 "and area, not the label); if none matches, skip that platform and say so in notes")
+    return hint
 
 
 # ---------------------------------------------------------------- listed nutrition from raw results
@@ -200,6 +291,41 @@ def _nutrition_of(item: dict[str, Any]) -> Listed | None:
     return None
 
 
+def _json_of(text: str) -> Any:
+    """Parse a tool result that is JSON, possibly followed by a text note (Swiggy appends one)."""
+    try:
+        value, _ = json.JSONDecoder().raw_decode((text or "").lstrip())
+        return value
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+_RESTAURANT_IDS = ("res_id", "restaurant_id", "restaurantId", "id")
+_DISTANCE_KEYS = ("distance_km", "distanceKm", "distance")
+
+
+def listed_distances(texts: Iterable[str]) -> dict[str, float]:
+    """Map restaurant ids to the distance (km) the platform states from the searched address
+    (Zomato `res_id` + `distance`, Swiggy `id` + `distanceKm`)."""
+    out: dict[str, float] = {}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            km = next((_num(node[k]) for k in _DISTANCE_KEYS if k in node and _num(node[k]) is not None), None)
+            rid = next((node[k] for k in _RESTAURANT_IDS if node.get(k) not in (None, "")), None)
+            if km is not None and rid is not None and 0 <= km < 100:
+                out.setdefault(str(rid), round(km, 1))
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    for text in texts:
+        walk(_json_of(text))
+    return out
+
+
 def listed_nutrition(texts: Iterable[str]) -> dict[str, Listed]:
     """Map item ids to the nutrition the platform lists for them, from raw tool results."""
     out: dict[str, Listed] = {}
@@ -218,10 +344,7 @@ def listed_nutrition(texts: Iterable[str]) -> dict[str, Listed]:
                 walk(v)
 
     for text in texts:
-        try:
-            walk(json.loads(text))
-        except (json.JSONDecodeError, TypeError):
-            continue
+        walk(_json_of(text))
     return out
 
 
@@ -260,7 +383,8 @@ def _round(x: float | None, nd: int = 1) -> float | None:
     return None if x is None else round(x, nd)
 
 
-def evaluate(dish: dict[str, Any], listed: Listed | None, goal: dict[str, Any], *, via: str = "") -> dict[str, Any]:
+def evaluate(dish: dict[str, Any], listed: Listed | None, goal: dict[str, Any], *, via: str = "",
+             distance_km: float | None = None) -> dict[str, Any]:
     """Pick the numbers to trust for one dish, then check it against the goal."""
     price = float(dish.get("price_inr") or 0)
     est = {"kcal": float(dish.get("est_kcal") or 0), "protein_g": float(dish.get("est_protein_g") or 0),
@@ -300,6 +424,7 @@ def evaluate(dish: dict[str, Any], listed: Listed | None, goal: dict[str, Any], 
         **{k: dish.get(k) for k in ("provider", "service", "merchant", "merchant_id", "dish", "item_id", "veg",
                                      "rating", "eta", "portion", "why")},
         "price_inr": price,
+        "distance_km": distance_km,  # from the platform's own data for the searched address; None if not stated
         "kcal": round(kcal), "protein_g": _round(protein), "carbs_g": _round(carbs), "fat_g": _round(fat),
         "source": source,  # "listed" = the platform's own numbers; "estimate" = Claude's
         "listed": ({**listed.as_dict(), "via": via or "parsed"} if listed else None),
@@ -319,6 +444,8 @@ _SORT_KEYS = {
     "protein": lambda d: (d["protein_g"], d["protein_per_100kcal"]),
     "kcal": lambda d: (-d["kcal"], d["protein_g"]),
     "per_rupee": lambda d: (d["protein_per_100inr"], d["protein_per_100kcal"]),
+    "rating": lambda d: (d.get("rating") or 0, -(d.get("price_inr") or 0)),
+    "indulgent": lambda d: (d["kcal"], d.get("rating") or 0),
 }
 
 
@@ -338,6 +465,8 @@ def resolve_goal(params: dict[str, Any]) -> dict[str, Any]:
     goal = {"max_kcal": None, "min_protein": None, "max_price": None, "sort": "density",
             **{k: v for k, v in GOALS.get(preset, {}).items() if k != "label"}}
     for k in ("max_kcal", "min_protein", "max_price"):
+        if goal.get("ignore_nutrition") and k != "max_price":
+            continue  # a treat ignores calorie and protein limits, even if some were sent
         if k in params:
             v = params[k]
             if v in (None, "", 0):
@@ -359,6 +488,9 @@ def resolve_goal(params: dict[str, Any]) -> dict[str, Any]:
 
 def describe_goal(goal: dict[str, Any]) -> str:
     parts = []
+    if goal.get("ignore_nutrition"):
+        parts.append("a treat: no calorie or protein limits - indulgent, rich, fried or sweet food is welcome; "
+                     "still fill in the per-serving estimates (shown for information only)")
     if goal.get("max_kcal"):
         parts.append(f"at most {goal['max_kcal']} kcal")
     if goal.get("min_protein"):
@@ -376,6 +508,9 @@ def describe_goal(goal: dict[str, Any]) -> str:
 def build_result(raw: dict[str, Any], texts: list[str], goal: dict[str, Any]) -> dict[str, Any]:
     """Turn Claude's candidates plus the raw tool results into a ranked, checked list."""
     listed_by_id = listed_nutrition(texts)
+    distances = listed_distances(texts)
+    off_craving = [d for d in raw.get("dishes", []) if d.get("matches_craving") is False]
+    raw = {**raw, "dishes": [d for d in raw.get("dishes", []) if d.get("matches_craving") is not False]}
     seen: set[tuple[str, str]] = set()
     dishes = []
     for d in raw.get("dishes", []):
@@ -389,7 +524,12 @@ def build_result(raw: dict[str, Any], texts: list[str], goal: dict[str, Any]) ->
             protein = d.get("listed_protein_g", -1)
             ok_protein = protein >= 0 and _stated_near(texts, str(d.get("item_id") or ""), protein)
             listed, via = Listed(kcal=d["listed_kcal"], protein=protein if ok_protein else None, shape="tool text"), "matched"
-        dishes.append(evaluate(d, listed, goal, via=via))
+        rid = str(d.get("merchant_id") or "")
+        km = distances.get(rid)
+        if km is None and (claimed := d.get("distance_km", -1)) is not None and claimed >= 0 \
+                and _stated_near(texts, rid, claimed):
+            km = float(claimed)  # stated in a shape the walker doesn't know, but really in the tool output
+        dishes.append(evaluate(d, listed, goal, via=via, distance_km=km))
     ranked = rank(dishes, goal["sort"])
     return {
         "dishes": ranked,
@@ -397,12 +537,13 @@ def build_result(raw: dict[str, Any], texts: list[str], goal: dict[str, Any]) ->
         "listed_count": sum(d["source"] == "listed" for d in ranked),
         "address_label": raw.get("address_label", ""),
         "notes": raw.get("notes", ""),
+        "dropped_off_craving": len(off_craving),
     }
 
 
 async def pick_dishes(
     agent: OrderAgent, goal: dict[str, Any], *, query: str = "", platforms: str = "Zomato and Swiggy",
-    address: str = "", limit: int = 20,
+    address: str = "", address_detail: str = "", limit: int = 20,
 ) -> dict[str, Any]:
     """Run the picker agent and return ranked dishes with checked nutrition."""
     from datetime import date
@@ -411,11 +552,15 @@ async def pick_dishes(
         today=date.today().isoformat(),
         goal=describe_goal(goal),
         query=query.strip() or "nothing specific - choose keywords that suit the goal",
+        search_rule=search_rule(query, goal),
+        craving_rule=(f" Every dish must be {query.strip()!r} (or that cuisine/kind of dish); set matches_craving "
+                      "false for anything else rather than leaving it out." if query.strip() else ""),
         platforms=platforms,
-        address=f'the address labelled "{address}"' if address else "the first (default) address",
+        address=address_detail or (f'the address labelled "{address}"' if address else "the first (default) address"),
         limit=limit,
     )
     agent.tool_log = []
+    agent.arg_guard = craving_guard(query) if query.strip() else None
     text = await agent.send("Find what I should order.", output_format={"type": "json_schema", "schema": DISH_SCHEMA},
                             max_tokens=32000)
     try:
