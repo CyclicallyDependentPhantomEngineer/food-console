@@ -1,4 +1,9 @@
-"""Connect to one or more remote MCP servers (via mcp-remote) and expose their tools to Claude."""
+"""Connect to MCP servers and expose their tools to Claude.
+
+Remote servers (Zomato, Swiggy, District, Zepto) run through mcp-remote, which handles their
+OAuth login; local servers (Blinkit) run as a subprocess of this package. Also: read-only
+detection and approval policy, the encrypted result cache, payment items in results,
+reconnects, and the `disabled` / `readOnlyTools` / `blockedTools` config options."""
 
 from __future__ import annotations
 

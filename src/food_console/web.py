@@ -1,5 +1,6 @@
-"""Local web UI: chat with Claude, run any Zomato/Swiggy MCP tool directly, pick dishes by
-calories and protein, and see joint stats.
+"""Local web UI (food-ui): chat with Claude across every connected service, run any MCP tool
+directly, pick dishes by calories and protein, see token usage per run, and see combined
+order-history stats.
 
 Security model: the server binds to 127.0.0.1 only and checks the Host header (blocks DNS
 rebinding). A one-time sign-in link printed in the terminal sets an HttpOnly, SameSite=Strict
@@ -551,7 +552,10 @@ async def _serve(args: argparse.Namespace) -> None:
 def main() -> None:
     load_dotenv()
     _use_ant_profile()
-    p = argparse.ArgumentParser(prog="food-ui", description="Joint Zomato + Swiggy web UI")
+    p = argparse.ArgumentParser(
+        prog="food-ui",
+        description="Food Console web UI: chat, actions, dish picker, token usage and order stats across "
+                    "Zomato, Swiggy, District, Zepto (and Blinkit, if enabled).")
     p.add_argument("--port", type=int, default=int(os.environ.get("FOOD_UI_PORT", "8765")))
     p.add_argument("--profile", help="ant profile to use (default: active profile or ANTHROPIC_PROFILE)")
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG)

@@ -1,4 +1,4 @@
-"""Joint Zomato + Swiggy order history: extraction via Claude, metrics in plain Python."""
+"""Combined order history across all services: extraction via Claude, metrics in plain Python."""
 
 from __future__ import annotations
 

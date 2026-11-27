@@ -189,7 +189,8 @@ uv run food-auth status                  # shows every service: logged in / not 
 ```
 
 `--app all` (the default) signs in to everything except servers that are off by default
-(Blinkit). Each browser login waits up to `--timeout` seconds (default 300).
+(Blinkit). Each browser login waits up to `--timeout` seconds (default 300). To use Blinkit,
+see [Enable Blinkit](#enable-blinkit).
 
 ### 4. Check everything connects
 
@@ -212,7 +213,7 @@ printed for the next browser. Stop with Ctrl+C.
 ## Using the web dashboard
 
 ```bash
-uv run food-ui                                   # every service in mcp_config.json
+uv run food-ui                                   # every enabled service in mcp_config.json
 uv run food-ui --server zomato-mcp --server swiggy-food   # only some services
 uv run food-ui --no-browser --port 9000          # don't open a browser; another port
 ```
@@ -267,7 +268,7 @@ Every terminal command is the same program with a different default service set:
 | `district-chat` | District |
 | `zepto-chat` | Zepto |
 | `blinkit-chat` | Blinkit |
-| `zomato-chat --provider all` | Everything |
+| `zomato-chat --provider all` | Every enabled service (Blinkit only once [enabled](#enable-blinkit)) |
 
 ```bash
 uv run zomato-chat                         # interactive chat
@@ -483,10 +484,8 @@ It uses the website the way you would, so it can break when Blinkit changes its 
 automating the site may be against Blinkit's terms. **Use at your own risk.**
 
 - **Off by default.** `mcp_config.json` marks it `"disabled": true`, so `food-ui`,
-  `--provider all` and `food-auth --app all` leave it out. It still runs when you ask for it
-  by name: `blinkit-chat`, `food-ui --server blinkit-mcp` (add the other servers you want
-  too), or `food-auth login --app blinkit`. Set `"disabled": false` to include it
-  everywhere.
+  `--provider all` and `food-auth --app all` leave it out. See
+  [Enable Blinkit](#enable-blinkit) to turn it on.
 
 - **Chrome window:** Blinkit blocks headless browsers with a bot check, so the window is
   visible. It opens only when a Blinkit tool is first used. If a check appears, solve it in
@@ -509,6 +508,45 @@ automating the site may be against Blinkit's terms. **Use at your own risk.**
   Login, saved addresses, the payment page and order history need a logged-in account and
   follow the original project's page selectors; they report what they saw rather than
   assuming success.
+
+#### Enable Blinkit
+
+1. **Install Google Chrome** (the integration drives it; `uv sync` already installed
+   Playwright).
+2. **Turn it on** in `mcp_config.json`: change `"disabled": true` to `"disabled": false`
+   for `blinkit-mcp`:
+
+   ```jsonc
+   "blinkit-mcp": {
+     "disabled": false,
+     "command": "${python}",
+     "args": ["-m", "food_console.blinkit.server"]
+   }
+   ```
+
+3. **Log in once** (mobile number, then the OTP Blinkit sends by SMS, both typed in the
+   terminal; the session is saved encrypted):
+
+   ```bash
+   uv run food-auth login --app blinkit
+   uv run food-auth status          # blinkit-mcp should show "logged in"
+   ```
+
+4. **Restart `food-ui`.** Blinkit now appears in the header and in Chat, Actions and Stats
+   (Pick covers restaurant delivery only). A Chrome window opens the first time a Blinkit
+   tool runs.
+
+To try it **without changing the config**, name it explicitly; nothing else changes:
+
+```bash
+uv run food-auth login --app blinkit     # log in
+uv run blinkit-chat                      # terminal chat with Blinkit only
+uv run food-ui --server zomato-mcp --server swiggy-food --server swiggy-instamart \
+  --server swiggy-dineout --server district-mcp --server zepto-mcp --server blinkit-mcp
+```
+
+To turn it off again, set `"disabled": true` (and optionally
+`uv run food-auth logout --app blinkit` to delete the saved session).
 
 <details>
 <summary>What changed from the original Blinkit project, and why</summary>
@@ -730,6 +768,7 @@ Haiku and Sonnet requests don't send it.
 | Blinkit shows "Just a moment…" | Blinkit's bot check; solve it in the Chrome window. |
 | Blinkit results are for the wrong area | Set the location first (`select_address` or `set_location`); search results warn when none is set. |
 | Stats are empty | Click **Refresh from accounts**; Stats only shows what has been collected. |
+| Blinkit doesn't appear in `food-ui` | It is off by default; see [Enable Blinkit](#enable-blinkit). `food-ui` prints the services it skipped at startup. |
 | `saved orders can't be decrypted` | The cache key changed or is missing. Run `food-cache clear orders` and refresh. |
 
 Service logs are in `.cache/logs/<server>.log`.
@@ -784,7 +823,7 @@ mcp_config.json      MCP server definitions
   based on item names. Neither is medical advice.
 - Claude API usage is billed to your Anthropic account; Stats refreshes and long chats use
   the most tokens. Every request re-sends the tool definitions of all connected services
-  (about 63K tokens with all seven), mostly from the prompt cache; connect fewer services
+  (about 61K tokens with the six default services), mostly from the prompt cache; connect fewer services
   with `--server` to send less.
 
 ## Credits and licence
