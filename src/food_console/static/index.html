@@ -161,6 +161,13 @@ pre { margin: 0; background: var(--soft); border-radius: 12px; padding: 12px 14p
 .composer textarea { border: 0; background: none; box-shadow: none; padding: 8px 0; resize: none; max-height: 160px;
   font-family: inherit; font-size: 14.5px; line-height: 1.45; }
 .composer .send { width: 42px; height: 42px; padding: 0; justify-content: center; border-radius: 13px; }
+.composer .mic { width: 42px; height: 42px; padding: 0; justify-content: center; border-radius: 13px; position: relative; flex: none; }
+.composer .mic.rec { background: var(--err); color: #fff; }
+.composer .mic.rec::after { content: ""; position: absolute; inset: 0; border-radius: 13px; border: 2px solid var(--err); animation: ping 1.4s infinite; }
+.composer .mic.busy svg { animation: rot 1s linear infinite; }
+.composer .mic.off { opacity: .45; }
+.voicenote { font-size: 12px; color: var(--muted); margin-top: 6px; min-height: 0; }
+.voicenote.err { color: var(--err); }
 .composer .hint { display: flex; justify-content: space-between; gap: 10px; margin-top: 8px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
 .composer .hint button { border: 0; background: none; color: var(--muted); cursor: pointer; display: inline-flex; gap: 5px; align-items: center; padding: 0; }
 .composer .hint button:hover { color: var(--ink); }
@@ -572,8 +579,10 @@ table.t.mini td, table.t.mini th { padding: 6px 8px; font-size: 12px; position: 
           <div class="composer">
             <div class="box">
               <textarea id="input" rows="1" placeholder="Ask about restaurants, groceries, tables, or your orders…"></textarea>
+              <button class="btn ghost mic" id="mic" title="Speak (transcribed on this computer)" aria-label="Voice input"><svg class="i" data-i="mic"></svg></button>
               <button class="btn primary send" id="send" title="Send"><svg class="i" data-i="send"></svg></button>
             </div>
+            <div class="voicenote" id="voicenote" hidden></div>
             <div class="hint">
               <span>Enter to send · Shift+Enter for a new line · anything that changes your account asks first</span>
               <label class="modelpick" title="Auto: a small model routes each message to Haiku (lookups), Sonnet (search, carts, orders) or Opus (analysis, planning)">Model
@@ -695,6 +704,9 @@ const ICONS = {
   ticket: '<path d="M3 8a2 2 0 0 0 2-2h14a2 2 0 0 0 2 2v2a2 2 0 0 0 0 4v2a2 2 0 0 0-2 2H5a2 2 0 0 0-2-2v-2a2 2 0 0 0 0-4V8Z"/><path d="M14 6v2M14 11v2M14 16v2"/>',
   gauge: '<path d="M4 18a9 9 0 1 1 16 0"/><path d="m12 14 4-5"/><circle cx="12" cy="14" r="1.5"/>',
   target: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.5"/>',
+  mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>',
+  stop: '<rect x="7" y="7" width="10" height="10" rx="2"/>',
+  spin: '<path d="M21 12a9 9 0 1 1-6.2-8.6"/>',
 };
 function icon(name, style) {
   const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -1003,6 +1015,75 @@ input.addEventListener("input", autosize);
   ms.addEventListener("change", () => { try { localStorage.setItem("chatModel", ms.value); } catch (e) {} }); }
 input.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
 sendBtn.addEventListener("click", send);
+
+// ---------- voice input ----------
+// Records in the browser, transcribes on this computer (Whisper, via /api/voice/transcribe)
+// and puts the text in the box. It never sends by itself: you check the words first.
+const voice = { info: null, rec: null, stream: null, chunks: [], timer: null, started: 0, cancelled: false };
+const micBtn = document.getElementById("mic"), voiceNote = document.getElementById("voicenote");
+function setMic(state, title) {
+  micBtn.classList.remove("rec", "busy", "off"); if (state) micBtn.classList.add(state);
+  micBtn.replaceChildren(icon(state === "rec" ? "stop" : state === "busy" ? "spin" : "mic"));
+  if (title) micBtn.title = title;
+}
+function note(text, isErr) { voiceNote.textContent = text || ""; voiceNote.classList.toggle("err", !!isErr); voiceNote.hidden = !text; }
+async function loadVoice() {
+  try { voice.info = await (await api("/api/voice")).json(); } catch (e) { voice.info = null; }
+  if (!voice.info?.available) setMic("off", "Voice input is not installed. In the terminal: " + (voice.info?.install || "uv sync --extra voice"));
+}
+async function startVoice() {
+  if (!voice.info?.available) { note("Voice input is not installed. Stop food-ui, run: uv sync --extra voice, then start it again.", true); return; }
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") { note("This browser cannot record audio.", true); return; }
+  try { voice.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } }); }
+  catch (e) { note(e.name === "NotAllowedError" ? "Microphone blocked. Allow it for this page in the browser's site settings." : "No microphone available: " + e.message, true); return; }
+  const type = ["audio/webm;codecs=opus", "audio/mp4", "audio/ogg;codecs=opus"].find(t => MediaRecorder.isTypeSupported(t));
+  voice.rec = new MediaRecorder(voice.stream, { ...(type ? { mimeType: type } : {}), audioBitsPerSecond: 32000 });
+  voice.chunks = []; voice.cancelled = false; voice.started = Date.now();
+  voice.rec.ondataavailable = e => { if (e.data.size) voice.chunks.push(e.data); };
+  voice.rec.onstop = finishVoice;
+  voice.rec.start();
+  setMic("rec", "Stop and transcribe (Esc cancels)");
+  const max = voice.info.max_seconds || 60;
+  const tick = () => {
+    const secs = Math.floor((Date.now() - voice.started) / 1000);
+    note(`Listening… ${secs}s · click the mic again when you're done · Esc cancels`);
+    if (secs >= max) stopVoice();
+  };
+  tick(); voice.timer = setInterval(tick, 250);
+}
+function stopVoice(cancel) {
+  if (!voice.rec || voice.rec.state === "inactive") return;
+  voice.cancelled = !!cancel; clearInterval(voice.timer); voice.rec.stop();
+}
+async function finishVoice() {
+  voice.stream?.getTracks().forEach(t => t.stop()); voice.stream = null;
+  const blob = new Blob(voice.chunks, { type: voice.rec?.mimeType || "audio/webm" }); voice.rec = null;
+  if (voice.cancelled || !blob.size) { setMic(null, "Speak (transcribed on this computer)"); note(""); return; }
+  setMic("busy", "Transcribing…");
+  note(voice.info?.loaded ? "Transcribing…" : "Loading the speech model… the very first time this downloads it (a few hundred MB).");
+  try {
+    const audio = await new Promise((ok, bad) => { const fr = new FileReader(); fr.onload = () => ok(String(fr.result).split(",")[1] || ""); fr.onerror = () => bad(fr.error); fr.readAsDataURL(blob); });
+    const r = await api("/api/voice/transcribe", { audio });
+    const out = await r.json();
+    if (!r.ok) throw new Error(out.error || "transcription failed");
+    if (voice.info) voice.info.loaded = true;
+    const text = (out.text || "").trim();
+    if (!text) { note("Didn't catch that. Try again, a little closer to the mic.", true); }
+    else {
+      input.value = input.value.trim() ? input.value.trimEnd() + " " + text : text;
+      autosize(); input.focus(); input.setSelectionRange(input.value.length, input.value.length);
+      note("Check the text, then press Enter to send.");
+    }
+  } catch (e) { note("Voice input failed: " + e.message, true); }
+  setMic(null, "Speak (transcribed on this computer)");
+}
+micBtn.addEventListener("click", () => {
+  if (micBtn.classList.contains("busy")) return;
+  if (voice.rec) stopVoice(); else startVoice();
+});
+document.addEventListener("keydown", e => { if (e.key === "Escape" && voice.rec) { e.preventDefault(); stopVoice(true); } });
+input.addEventListener("input", () => { if (!voice.rec && voiceNote.textContent.startsWith("Check")) note(""); });
+loadVoice();
 document.getElementById("logout").addEventListener("click", async () => {
   await api("/api/logout", {}); location.replace("/");
 });

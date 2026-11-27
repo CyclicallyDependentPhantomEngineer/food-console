@@ -32,6 +32,11 @@ food-ui = "food_console.web:main"
 food-auth = "food_console.auth:main"
 food-cache = "food_console.store:main"
 
+[project.optional-dependencies]
+voice = [
+    "faster-whisper>=1.2.1",
+]
+
 [build-system]
 requires = ["uv_build>=0.13.6,<0.14.0"]
 build-backend = "uv_build"
@@ -40,3 +45,7 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.2.0",
 ]
+
+[tool.uv]
+# Hold back releases newer than two weeks when the voice extra was added; relax on the next upgrade.
+constraint-dependencies = ["ctranslate2<=4.9.0", "huggingface-hub<=2.4.0"]

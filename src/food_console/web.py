@@ -36,7 +36,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import _use_ant_profile
+from . import _use_ant_profile, voice
 from .agent import MODEL, OrderAgent
 from .store import Store
 from .credentials import AccountChanged, credential_fingerprint
@@ -72,6 +72,9 @@ SESSION_COOKIE = "food_console_session"
 SESSION_SECONDS = 8 * 3600
 APPROVAL_SECONDS = 120
 MAX_REQUEST_BYTES = 64_000
+# Voice clips are posted as base64 in JSON: up to voice.MAX_AUDIO_BYTES of audio.
+VOICE_PATH = "/api/voice/transcribe"
+VOICE_MAX_REQUEST_BYTES = 2_800_000
 
 
 class BodyLimitMiddleware:
@@ -83,13 +86,14 @@ class BodyLimitMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         chunks, size = [], 0
+        limit = VOICE_MAX_REQUEST_BYTES if scope.get("path") == VOICE_PATH else MAX_REQUEST_BYTES
         while True:
             message = await receive()
             if message["type"] == "http.disconnect":
                 return
             chunk = message.get("body", b"")
             size += len(chunk)
-            if size > MAX_REQUEST_BYTES:
+            if size > limit:
                 return await JSONResponse({"error": "request too large"}, status_code=413)(scope, receive, send)
             chunks.append(chunk)
             if not message.get("more_body", False):
@@ -126,6 +130,9 @@ class AppState:
         self.chat_lock = asyncio.Lock()
         self.stats_lock = asyncio.Lock()
         self.pick_lock = asyncio.Lock()
+        # Local speech-to-text (optional `voice` extra); the model loads on first use.
+        self.transcriber = voice.Transcriber() if voice.available() else None
+        self.voice_lock = asyncio.Lock()
         self.pending: dict[str, asyncio.Future[bool]] = {}
         self.pending_sessions: dict[str, str] = {}
         self.manual_approvals: dict[str, dict[str, Any]] = {}
@@ -529,6 +536,32 @@ def build_app(state: AppState) -> Starlette:
         runs = [summarize(r) for r in state.store.load_usage(since, until)]
         return JSONResponse({"runs": runs, **aggregate(runs), "prices": PRICES})
 
+    async def voice_status(request: Request) -> Response:
+        t = state.transcriber
+        return JSONResponse({"available": t is not None, "model": t.name if t else None,
+                             "loaded": bool(t and t.loaded), "max_seconds": voice.MAX_AUDIO_SECONDS,
+                             "install": "uv sync --extra voice"})
+
+    async def voice_transcribe(request: Request) -> Response:
+        t = state.transcriber
+        if t is None:
+            return JSONResponse({"error": "Voice input is not installed. Run: uv sync --extra voice"}, status_code=503)
+        body = await request.json()
+        try:
+            audio = base64.b64decode(str(body.get("audio") or ""), validate=True)
+        except ValueError:
+            return JSONResponse({"error": "audio must be base64"}, status_code=400)
+        orders = ((state.store.load_orders() if state.store else None) or {}).get("orders", [])
+        hints = voice.hints_from_orders(orders)
+        async with state.voice_lock:  # one clip at a time; the CPU is the bottleneck
+            try:
+                result = await asyncio.to_thread(t.transcribe, audio, hints)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            except Exception as exc:
+                return JSONResponse({"error": f"Transcription failed: {exc}"}, status_code=500)
+        return JSONResponse(result)
+
     async def usage_clear(request: Request) -> Response:
         n = state.store.clear("usage") if state.store else 0
         return JSONResponse({"cleared": n})
@@ -591,6 +624,8 @@ def build_app(state: AppState) -> Starlette:
             Route("/api/stats/compare", stats_compare),
             Route("/api/usage", usage),
             Route("/api/usage/clear", usage_clear, methods=["POST"]),
+            Route("/api/voice", voice_status),
+            Route(VOICE_PATH, voice_transcribe, methods=["POST"]),
             Route("/api/pick", pick_last),
             Route("/api/pick/addresses", pick_addresses),
             Route("/api/pick", pick, methods=["POST"]),
@@ -647,6 +682,8 @@ async def _serve(args: argparse.Namespace) -> None:
     print(f"mcp-remote logs: {LOG_DIR}")
     store = Store(credential_source=lambda: credential_fingerprint(args.config))
     print(f"Local cache: {store.path}")
+    print(f"Voice input: on (local Whisper {voice.model_name()}; first use downloads the model)" if voice.available()
+          else "Voice input: off (install with: uv sync --extra voice)")
     async with MCPBridge(servers, connect_timeout=args.connect_timeout, log_dir=LOG_DIR, require_any=False,
                          store=store, cache_ttl=args.cache_ttl, read_only_tools=read_only_tools,
                          blocked_tools=blocked_tools, read_only_operations=operations, payment_tools=payments) as mcp:
