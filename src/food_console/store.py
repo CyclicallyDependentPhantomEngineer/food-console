@@ -1,12 +1,14 @@
-"""Local SQLite store: cached read-only tool results and tool lists, plus saved order history.
+"""Local SQLite store: cached read-only tool results and tool lists, saved order history,
+the last dish pick and the token-usage history.
 
 Used as a fallback when a server is offline or rate-limited (HTTP 429), and to avoid
 repeating identical read requests within a short window.
 
 Personal data is encrypted at rest (Fernet: AES-128-CBC + HMAC-SHA256): cached tool
-arguments and results, saved orders and their metadata. The key lives in the macOS
+arguments and results, saved orders and their metadata, the last dish pick, and the
+token-usage history (which includes the user's messages). The key lives in the macOS
 Keychain (any `keyring` backend elsewhere); if no keychain is available it falls back to
-an owner-only key file next to the database. Order ids are stored only as salted hashes.
+an owner-only key file next to the database. Order ids are stored only as keyed (HMAC) hashes.
 Tool definitions (public API descriptions) are kept in plain text. The file itself is
 owner-only (0600) inside an owner-only (0700) `.cache/` folder.
 """

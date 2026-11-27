@@ -213,7 +213,7 @@ printed for the next browser. Stop with Ctrl+C.
 ## Using the web dashboard
 
 ```bash
-uv run food-ui                                   # every service in mcp_config.json
+uv run food-ui                                   # every enabled service in mcp_config.json
 uv run food-ui --server zomato-mcp --server swiggy-food   # only some services
 uv run food-ui --no-browser --port 9000          # don't open a browser; another port
 ```
@@ -268,7 +268,7 @@ Every terminal command is the same program with a different default service set:
 | `district-chat` | District |
 | `zepto-chat` | Zepto |
 | `blinkit-chat` | Blinkit |
-| `zomato-chat --provider all` | Everything |
+| `zomato-chat --provider all` | Every enabled service (Blinkit only once [enabled](#enable-blinkit)) |
 
 ```bash
 uv run zomato-chat                         # interactive chat
@@ -768,6 +768,7 @@ Haiku and Sonnet requests don't send it.
 | Blinkit shows "Just a moment…" | Blinkit's bot check; solve it in the Chrome window. |
 | Blinkit results are for the wrong area | Set the location first (`select_address` or `set_location`); search results warn when none is set. |
 | Stats are empty | Click **Refresh from accounts**; Stats only shows what has been collected. |
+| Blinkit doesn't appear in `food-ui` | It is off by default; see [Enable Blinkit](#enable-blinkit). `food-ui` prints the services it skipped at startup. |
 | `saved orders can't be decrypted` | The cache key changed or is missing. Run `food-cache clear orders` and refresh. |
 
 Service logs are in `.cache/logs/<server>.log`.
@@ -822,7 +823,7 @@ mcp_config.json      MCP server definitions
   based on item names. Neither is medical advice.
 - Claude API usage is billed to your Anthropic account; Stats refreshes and long chats use
   the most tokens. Every request re-sends the tool definitions of all connected services
-  (about 63K tokens with all seven), mostly from the prompt cache; connect fewer services
+  (about 61K tokens with the six default services), mostly from the prompt cache; connect fewer services
   with `--server` to send less.
 
 ## Credits and licence
