@@ -189,7 +189,8 @@ uv run food-auth status                  # shows every service: logged in / not 
 ```
 
 `--app all` (the default) signs in to everything except servers that are off by default
-(Blinkit). Each browser login waits up to `--timeout` seconds (default 300).
+(Blinkit). Each browser login waits up to `--timeout` seconds (default 300). To use Blinkit,
+see [Enable Blinkit](#enable-blinkit).
 
 ### 4. Check everything connects
 
@@ -483,10 +484,8 @@ It uses the website the way you would, so it can break when Blinkit changes its 
 automating the site may be against Blinkit's terms. **Use at your own risk.**
 
 - **Off by default.** `mcp_config.json` marks it `"disabled": true`, so `food-ui`,
-  `--provider all` and `food-auth --app all` leave it out. It still runs when you ask for it
-  by name: `blinkit-chat`, `food-ui --server blinkit-mcp` (add the other servers you want
-  too), or `food-auth login --app blinkit`. Set `"disabled": false` to include it
-  everywhere.
+  `--provider all` and `food-auth --app all` leave it out. See
+  [Enable Blinkit](#enable-blinkit) to turn it on.
 
 - **Chrome window:** Blinkit blocks headless browsers with a bot check, so the window is
   visible. It opens only when a Blinkit tool is first used. If a check appears, solve it in
@@ -509,6 +508,45 @@ automating the site may be against Blinkit's terms. **Use at your own risk.**
   Login, saved addresses, the payment page and order history need a logged-in account and
   follow the original project's page selectors; they report what they saw rather than
   assuming success.
+
+#### Enable Blinkit
+
+1. **Install Google Chrome** (the integration drives it; `uv sync` already installed
+   Playwright).
+2. **Turn it on** in `mcp_config.json`: change `"disabled": true` to `"disabled": false`
+   for `blinkit-mcp`:
+
+   ```jsonc
+   "blinkit-mcp": {
+     "disabled": false,
+     "command": "${python}",
+     "args": ["-m", "food_console.blinkit.server"]
+   }
+   ```
+
+3. **Log in once** (mobile number, then the OTP Blinkit sends by SMS, both typed in the
+   terminal; the session is saved encrypted):
+
+   ```bash
+   uv run food-auth login --app blinkit
+   uv run food-auth status          # blinkit-mcp should show "logged in"
+   ```
+
+4. **Restart `food-ui`.** Blinkit now appears in the header and in Chat, Actions and Stats
+   (Pick covers restaurant delivery only). A Chrome window opens the first time a Blinkit
+   tool runs.
+
+To try it **without changing the config**, name it explicitly; nothing else changes:
+
+```bash
+uv run food-auth login --app blinkit     # log in
+uv run blinkit-chat                      # terminal chat with Blinkit only
+uv run food-ui --server zomato-mcp --server swiggy-food --server swiggy-instamart \
+  --server swiggy-dineout --server district-mcp --server zepto-mcp --server blinkit-mcp
+```
+
+To turn it off again, set `"disabled": true` (and optionally
+`uv run food-auth logout --app blinkit` to delete the saved session).
 
 <details>
 <summary>What changed from the original Blinkit project, and why</summary>
