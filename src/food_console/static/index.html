@@ -578,6 +578,7 @@ table.t.mini td, table.t.mini th { padding: 6px 8px; font-size: 12px; position: 
               <span>Enter to send · Shift+Enter for a new line · anything that changes your account asks first</span>
               <label class="modelpick" title="Auto: a small model routes each message to Haiku (lookups), Sonnet (search, carts, orders) or Opus (analysis, planning)">Model
                 <select id="modelsel"><option value="auto">Auto</option><option value="haiku">Haiku 5.5</option><option value="sonnet">Sonnet 5.5</option><option value="opus">Opus 5.5</option></select></label>
+              <button id="logout">Sign out</button>
               <button id="reset"><svg class="i" data-i="refresh" style="width:14px;height:14px"></svg>New conversation</button>
             </div>
           </div>
@@ -774,7 +775,7 @@ function inline(s) {
           .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
 }
 function markdown(src) {
-  const lines = esc(src).split("\n"); const out = []; let i = 0;
+  const lines = esc(String(src ?? "").slice(0, 200000)).split("\n"); const out = []; let i = 0;
   const isRow = l => /^\s*\|.*\|\s*$/.test(l);
   const cells = l => l.trim().replace(/^\||\|$/g, "").split("|").map(c => inline(c.trim()));
   const list = /^\s*([-*•]|\d+\.)\s+/;
@@ -795,6 +796,8 @@ function markdown(src) {
       out.push(`<${ordered ? "ol" : "ul"}>${items.map(x => `<li>${x}</li>`).join("")}</${ordered ? "ol" : "ul"}>`); continue;
     }
     if (!l.trim()) { i++; continue; }
+    // A pipe row without a separator is ordinary text. Always advance the cursor.
+    if (isRow(l)) { out.push(`<p>${inline(l)}</p>`); i++; continue; }
     const p = []; while (i < lines.length && lines[i].trim() && !isRow(lines[i]) && !/^(#{1,4}\s|```)/.test(lines[i]) && !list.test(lines[i])) p.push(inline(lines[i++]));
     out.push(`<p>${p.join("<br>")}</p>`);
   }
@@ -1000,6 +1003,9 @@ input.addEventListener("input", autosize);
   ms.addEventListener("change", () => { try { localStorage.setItem("chatModel", ms.value); } catch (e) {} }); }
 input.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
 sendBtn.addEventListener("click", send);
+document.getElementById("logout").addEventListener("click", async () => {
+  await api("/api/logout", {}); location.replace("/");
+});
 document.getElementById("reset").addEventListener("click", async () => {
   const r = await api("/api/chat/reset", {});
   if (r.ok) { log.replaceChildren(welcome()); input.focus(); }
@@ -1023,7 +1029,7 @@ function renderToolList() {
   const q = document.getElementById("toolsearch").value.toLowerCase();
   const box = document.getElementById("toollist"); box.replaceChildren();
   let last = null;
-  for (const t of TOOLS) {
+  for (const t of TOOLS || []) {
     if (FILTER && t.server !== FILTER) continue;
     if (q && !(t.label + " " + t.description).toLowerCase().includes(q)) continue;
     const s = svc(t.server);
@@ -1093,21 +1099,30 @@ function renderDetail(t) {
         el("span", { class: "grow" }), copy), pre));
     if (payments && payments.length) { const pc = paymentCard(payments, { tool: t.label }); pc.style.marginLeft = "0"; pc.style.marginBottom = "12px"; result.prepend(pc); }
   };
-  const run = async confirm => {
-    let args; try { args = collect(); } catch (e) { result.replaceChildren(el("div", { class: "note", style: { color: "var(--err)" } }, icon("alert"), e.message)); return; }
+  const run = async (confirm, reviewedArgs = null, approvalId = null) => {
+    let args; try { args = reviewedArgs || collect(); } catch (e) { result.replaceChildren(el("div", { class: "note", style: { color: "var(--err)" } }, icon("alert"), e.message)); return; }
     if (t.needs_confirm && !confirm) {
+      // Ask the server to bind a one-use review to this exact immutable snapshot.
+      const snapshot = JSON.parse(JSON.stringify(args));
+      let review;
+      try {
+        const response = await api("/api/tools/" + encodeURIComponent(t.name), { args: snapshot, confirm: false, review: true });
+        review = await response.json();
+        if (response.status !== 409 || !review.approval_id) throw new Error(review.error || "Could not prepare review");
+      } catch (e) { result.replaceChildren(el("div", { class: "note" }, e.message)); return; }
       confirmBox.replaceChildren(el("div", { class: "approval fade", style: { "margin-left": "0" } },
         el("div", { class: "head" }, icon("shield"), t.destructive ? "This is destructive" : "This changes your account"),
         el("div", { class: "body" }, el("div", {}, "Check the details, then confirm:"), kvList(args),
+          ...(review.reviewed_cart ? [el("strong", {}, "Live cart to approve"), kvList(review.reviewed_cart)] : []),
           el("div", { class: "actions" },
-            el("button", { class: "btn ok", onclick: () => { confirmBox.replaceChildren(); run(true); } }, icon("check"), "Confirm and run"),
+            el("button", { class: "btn ok", onclick: () => { confirmBox.replaceChildren(); run(true, snapshot, review.approval_id); } }, icon("check"), "Confirm and run"),
             el("button", { class: "btn ghost", onclick: () => confirmBox.replaceChildren() }, "Cancel")))));
       return;
     }
     runBtn.disabled = true; result.replaceChildren(el("div", { class: "progress" }, el("span", { class: "spin" }), "Running…"));
     const t0 = performance.now();
     try {
-      const r = await api("/api/tools/" + encodeURIComponent(t.name), { args, confirm: confirm === true });
+      const r = await api("/api/tools/" + encodeURIComponent(t.name), { args, confirm: confirm === true, approval_id: approvalId });
       const d = await r.json(); if (!r.ok) throw new Error(d.error);
       showResult(d.result, d.is_error, Math.round(performance.now() - t0), d.source, d.cached_at, d.payments);
     } catch (e) { result.replaceChildren(el("div", { class: "note", style: { color: "var(--err)" } }, icon("alert"), e.message)); }

@@ -17,13 +17,13 @@ from .store import Store
 _HISTORY_TOOL = re.compile(r"order|history|booking|address", re.I)
 
 
-# District exposes everything through two generic read-only tools: `search` finds an
-# operation (e.g. consumer.booking_history) and `execute` runs it.
+# District search discovers operations; execute is restricted to locally reviewed
+# read-only operation names by the agent and bridge, including in Stats.
 _DISPATCH_TOOLS = {"district": {"search", "execute"}}
 
 
 def history_tool_filter(tool: BridgedTool) -> bool:
-    if not tool.read_only:
+    if not tool.read_only and not getattr(tool, "read_operations", {}):
         return False
     return bool(_HISTORY_TOOL.search(tool.mcp_name)) or tool.mcp_name in _DISPATCH_TOOLS.get(tool.server, set())
 

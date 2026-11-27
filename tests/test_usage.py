@@ -65,7 +65,7 @@ def test_agent_records_each_api_call():
     agent = OrderAgent.__new__(OrderAgent)
     agent.messages, agent.usage, agent.on_event = [], {"input": 0, "output": 0, "cache_read": 0}, lambda e: None
     agent.usage_kind, agent.usage_label, agent._run, agent.tool_filter = "chat", None, None, None
-    agent.mcp = SimpleNamespace(tools={})
+    agent.mcp = SimpleNamespace(tools={}, store=None)
     agent.router, agent.model_override, agent.model, agent.effort, agent.tier = None, None, "claude-opus-5-5", "medium", None
     recorded = []
     agent.on_usage = recorded.append

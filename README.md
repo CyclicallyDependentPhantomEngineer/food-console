@@ -24,11 +24,12 @@ going-out accounts. You can ask things like "find a high-protein lunch under 600
 me", "compare my Zomato and Swiggy spending this month" or "add milk and eggs to my
 Instamart cart", and see your combined order history as a dashboard.
 
-**Quick start** (macOS, Python 3.11+, Node 18+, [uv](https://docs.astral.sh/uv/)):
+**Quick start** (macOS, Python 3.11+, Node 20.18.1+, [uv](https://docs.astral.sh/uv/)):
 
 ```bash
 git clone https://github.com/<you>/food-console.git && cd food-console
-uv sync                                  # install dependencies
+uv sync                                  # install Python dependencies
+npm ci --ignore-scripts                    # install the locked MCP transport
 brew install anthropics/tap/ant          # Claude CLI, used for sign-in (no API key needed)
 ant auth login                           # sign in to Claude once
 uv run food-auth login --app zomato      # sign in to the services you use (browser opens)
@@ -39,7 +40,7 @@ uv run food-ui                           # start the web dashboard
 
 | | |
 |---|---|
-| **Chat** | One conversation across every connected service; UPI payments shown as a QR you scan |
+| **Chat** | One conversation across connected services; payments completed in the provider app or a verified UPI adapter |
 | **Actions** | Every tool every service offers, as a form you can run by hand |
 | **Pick** | Dishes near a saved address ranked by calories and protein (or a no-limits **treat**), with distances |
 | **Usage** | Tokens and estimated cost of every chat message, Pick search and Stats refresh |
@@ -92,8 +93,8 @@ macOS Keychain; the web UI is bound to `127.0.0.1` behind a one-time sign-in lin
   minimum, a price limit and veg/non-veg, or as a no-limits **treat**. A craving is the
   only thing searched. Uses the platform's own nutrition numbers and distances when it
   publishes them, checks nutrition for obvious errors, and clearly marks estimates.
-- **Safe payments.** UPI payment requests are shown as a QR with the payee and exact
-  amount; you pay in your UPI app with your PIN. Ways to pay without a PIN are off by
+- **Safe payments.** Reviewed structured UPI adapters can show a QR bound to the approved order, payee and amount;
+  other payments are completed in the provider app or Chrome. Ways to pay without a PIN are off by
   default.
 - **Model routing and usage tracking.** Each request goes to Haiku, Sonnet or Opus 5.5
   depending on the task, and the Usage tab shows tokens and estimated cost per run.
@@ -117,7 +118,7 @@ macOS Keychain; the web UI is bound to `127.0.0.1` behind a one-time sign-in lin
 | **Blinkit** | Groceries | **Unofficial, off by default**: drives blinkit.com in a Chrome window ([details](#blinkit-unofficial)) | Phone number + SMS OTP |
 
 The official servers are reached through [`mcp-remote`](https://www.npmjs.com/package/mcp-remote)
-(pinned to an exact version), which handles each service's OAuth login and stores the
+(including transitive dependencies pinned in `package-lock.json`), which handles each service's OAuth login and stores the
 tokens in `~/.mcp-auth`.
 
 ## How it works
@@ -146,7 +147,7 @@ flowchart LR
 | macOS (Linux likely works; untested) | Keychain is used for the cache key | |
 | Python 3.11+ | The app | `python3 --version` |
 | [uv](https://docs.astral.sh/uv/) | Installs and runs the project | `uv --version` |
-| Node.js 18+ | `npx` runs `mcp-remote` for the official servers | `node --version` |
+| Node.js 20.18.1+ | Runs the locally installed, locked `mcp-remote` transport | `node --version` |
 | [`ant` CLI](https://platform.claude.com/docs/en/cli-sdks-libraries/cli/quickstart) | Claude sign-in (no API key) | `ant auth status` |
 | Google Chrome | Only for Blinkit | |
 | Accounts on the services you want | Swiggy needs at least one saved address and payment method; all services are India-only | |
@@ -159,6 +160,7 @@ flowchart LR
 git clone https://github.com/<you>/food-console.git
 cd food-console
 uv sync
+npm ci --ignore-scripts
 ```
 
 ### 2. Sign in to Claude
@@ -228,8 +230,8 @@ Ask in plain language across all services. Tool activity appears as chips (marke
 that is not read-only, an **approval card** shows the tool and its exact arguments;
 nothing runs until you click **Approve and run**. Each reply starts with a small chip
 naming the model that answered and why; the **Model** menu under the chat box overrides
-the automatic choice. When an order needs a UPI payment, a [payment card](#payments)
-shows the QR, payee and amount, and **I've paid — check status** confirms the order.
+the automatic choice. Payment cards require a reviewed adapter (see [Payments](#payments)); otherwise complete payment
+in the provider app or Chrome, then ask chat to check the order status.
 
 Example prompts:
 
@@ -457,21 +459,23 @@ later, asks first.
 
 ### Swiggy
 
-Swiggy labels its tools, and the labels are used as-is. `swiggy-chat` connects to Food,
+Swiggy tools use the locally reviewed read-only allowlists in `mcp_config.json`. `swiggy-chat` connects to Food,
 Instamart and Dineout together; if one fails the others keep working.
 
 ### District
 
 District routes almost everything through two generic tools: `search` (finds an
-operation) and `execute` (runs read-only operations). Both are labelled read-only by
-District, as are payment status and payment options. `act`, `pay`, `cancel_payment` and
+operation) and `execute` (reads its result). Both are locally allowlisted: District’s
+[published contract](https://studio.district.in/mcp/) separates read-only `execute` from
+mutating `act` and `pay`. Movie/event/restaurant lookups and Stats bill/booking history
+therefore run without approval.
+Payment status and payment options are separately allowlisted. `act`, `pay`, `cancel_payment` and
 the OTP login tools always ask.
 
 ### Zepto
 
-Zepto labels search, cart view, order history and payment status as read-only. Placing an
-order, changing the cart, addresses, store or name always ask. (Zepto marks its order tools
-"not destructive" but not read-only; that is enough to require approval here.) Picking a
+The local Zepto allowlist covers search, cart view, order history and payment status. Placing an
+order, changing the cart, addresses, store or name always ask. (Server annotations do not change the local approval policy.) Picking a
 saved address or store also asks, so expect one approval per session before shopping.
 
 ### Blinkit (unofficial)
@@ -501,8 +505,7 @@ automating the site may be against Blinkit's terms. **Use at your own risk.**
 - **Money guard:** `checkout(expected_total_inr)` and
   `place_order(payment, expected_total_inr)` refuse to continue unless the cart total
   equals the total you approved. Any later cart or address change voids that total. The
-  payment method (`cod` or `upi_qr`) must be chosen explicitly. A UPI QR is shown as a
-  payment card (see [Payments](#payments)).
+  payment method (`cod` or `upi_qr`) must be chosen explicitly. The UPI QR remains in Chrome (see [Payments](#payments)).
 - **Tested live while logged out:** location search, product search (price, MRP,
   discount, ETA, sponsored flag), add/remove, cart and bill parsing, and the total guard.
   Login, saved addresses, the payment page and order history need a logged-in account and
@@ -554,7 +557,7 @@ To turn it off again, set `"disabled": true` (and optionally
 | Original | Here |
 |---|---|
 | `SERVE_HTTPS=true` exposes the server on `0.0.0.0:8000` with no authentication | stdio only, no network listener |
-| No tool labels, so clients may run `pay_now` / `checkout` without asking | read-only / destructive labels; non-read-only tools need approval |
+| No tool labels, so clients may run `pay_now` / `checkout` without asking | local read-only allowlist; other tools need approval |
 | Payment method auto-picked (cash on delivery if available) | `cod` / `upi_qr` must be chosen; total must match what the user approved |
 | Session cookies (incl. access token) in plaintext `~/.blinkit_mcp/cookies/auth.json` | encrypted with the Keychain key, owner-only file |
 | Location from `http://ip-api.com` (third party, plain HTTP) on every start | no IP lookup; saved address or a place you name |
@@ -566,53 +569,53 @@ To turn it off again, set `"disabled": true` (and optionally
 
 ## Payments
 
-The official servers (Swiggy, District, Zepto) expect a chat app that displays their
-payment widget. This app shows the same thing as a **payment card** in Chat (and under the
-result in Actions):
+**Swiggy Food UPI QR is enabled by default.** Before checkout, Chat and Actions fetch a
+live cart and show its items, restaurant, delivery address ID and final total in the
+approval. That snapshot is single-use and expires after two minutes. Immediately before
+submitting, the bridge reads the cart again; changed items, address or total require a
+new review. An unavailable cart prevents submission.
 
-- **UPI QR:** for a UPI payment request (`upi://pay…`, or app-specific links such as
-  `tez://upi/pay…`), the card shows the exact amount, the payee name and UPI ID, and a QR
-  code drawn locally from the platform's own request, unchanged. Scan it with any UPI app.
-- **QR images** sent by the service are shown as they are.
-- **Payment links** on payment gateways (Razorpay, Paytm, PhonePe, Juspay, Cashfree, PayU,
-  BillDesk), or on the services' own payment pages, get a QR and an **Open payment page**
-  button. Links on any other site are never turned into a card.
-- **I've paid — check status** asks Claude to check the payment status and confirm the
-  order. Claude is told never to call an order placed before that.
+The adapter reads only the checkout response’s dedicated `upiIntentUrl` field. It binds
+the returned order to the approved call/address (and cart ID when supplied) and checks the UPI amount (and checkout
+total, when supplied) against the approved total. The payee comes from that dedicated
+provider payment field, never a product name or arbitrary response text. The app generates
+the QR locally and displays the payee and amount; verify both in your UPI app before
+entering your PIN. A pending payment is not a confirmed order. This follows Swiggy’s
+[cart contract](https://mcp.swiggy.com/builders/docs/reference/food/get_food_cart/) and
+[checkout contract](https://mcp.swiggy.com/builders/docs/reference/food/place_food_order/).
+External cart changes after the final check cannot be made atomic by this client; a
+conflicting checkout amount/address/cart suppresses the QR without retrying checkout.
 
-How this keeps paying safe:
+The shipped config uses `"paymentTools": {"place_food_order": {"adapter": "swiggy-food"}}`.
+Other integrations need a reviewed adapter, or payment in the provider app/browser.
+Blinkit’s QR remains in Chrome. The generic adapter still supports `uriField`, `orderField`,
+`orderArgument`, `amountArgument` and `payeeArgument` for providers with those input
+contracts. Arbitrary images and opaque payment links are never promoted to payment cards.
 
-- **You pay, not the app.** Money only moves when you approve it in your UPI app with your
-  PIN. Nothing in this app can complete a payment, and it stores no card, UPI or wallet
-  details.
-- **Check before your PIN.** The card shows the payee and the exact amount (paise
-  included); your UPI app shows them again before you enter the PIN.
-- **Only from account-changing tools.** Payment cards are built only from results of tools
-  that needed your approval (placing an order, paying). A UPI link inside a menu, review or
-  search result is never shown as a card.
-- **No PIN-less payment by default.** Ways to pay without your PIN are turned off with
-  `blockedTools` in `mcp_config.json`: Zepto's wallet (`create_wallet_order`) and UPI
-  Reserve Pay (`create_upi_reserve_pay_order`, a pre-authorised mandate). Remove an entry
-  to allow it; it still asks for approval.
-- **Cash on delivery** remains available where the service offers it.
+An invalid payment response cannot turn an already completed account action into a failed
+order. If an action times out or its outcome is unknown, fetch live order/payment status
+before any retry. Chat additionally blocks further writes until a new conversation is
+started after checking status. Manual actions still require a fresh review.
 
-About "payment MCP servers": the ones that exist (Razorpay, Paytm, Juspay) are for
-merchants collecting money, not for paying as a customer. Giving an agent a way to pay
-without your PIN (stored wallet, card or mandate) is exactly what this app avoids.
-
-In the terminal apps, a UPI QR is printed in the terminal, a payment link is printed as a
-URL, and a QR image is saved owner-only to `.cache/` and opened.
+Zepto wallet and UPI Reserve Pay tools remain blocked by default. Cash on delivery is
+available where supported. Blinkit requires a matching cart/address snapshot and refuses
+automation when it cannot reverify the current cart or the final cash-payment button
+does not display the approved amount; finish in Chrome in that case.
 
 ## Safety and privacy
 
 ### Approval gate
 
 Any tool that is not known to be read-only needs your explicit approval: `y` in the
-terminal, **Approve and run** in the web UI. "Known read-only" means the service labels the
-tool read-only, or, for services that send no labels (Zomato), the tool is listed in
-`readOnlyTools` in `mcp_config.json`. Tool names alone are never trusted. Declined calls
+terminal, **Approve and run** in the web UI. "Known read-only" means the tool is in the locally reviewed
+`readOnlyTools` allowlist in `mcp_config.json`. Server annotations never grant an exemption.
+Mixed dispatchers can use `readOnlyOperations` to exempt only exact argument values.
+District’s documented read-only `execute` endpoint is allowlisted as a whole; `act`, `pay`
+and unknown tools still require approval and are blocked in Stats/Pick sessions. Declined calls
 are reported back to Claude as errors and it is told not to retry them. `--no-orders`
-blocks non-read-only tools outright.
+blocks non-read-only tools outright. Manual Actions reviews are single-use, expire after
+two minutes, and bind the exact arguments, session and tool definition; editing a form
+after review cannot change the approved call.
 
 ### What stays on your machine
 
@@ -632,23 +635,26 @@ blocks non-read-only tools outright.
 
 - Listens on `127.0.0.1` only and rejects any other `Host` header (blocks DNS rebinding).
 - One-time sign-in link sets an `HttpOnly`, `SameSite=Strict` session cookie; the link
-  stops working after use.
+  stops working after use. Sessions expire after eight hours; **Sign out** revokes the
+  session and its pending approvals.
 - Every API call also needs an `X-Food-Console` header, which other websites can't send.
-- Strict Content-Security-Policy, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`.
+- Content-Security-Policy permits only the SHA-256 hash of the bundled script; `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`.
 - All model and tool text is HTML-escaped before rendering.
 
 ### Other safeguards
 
-- `mcp-remote` is pinned to an exact version in `mcp_config.json` (update it
-  deliberately).
+- `mcp-remote` and its transitive dependencies are locked in `package-lock.json`.
+  Run `npm ci --ignore-scripts`; startup never downloads packages via `npx`.
+- Requests and tool arguments are limited to 64 KB; processed tool results to 2 MB.
+  Tool calls have a 120-second deadline; a web chat, Pick or Stats run has a 10-minute deadline.
 - `.cache/` is owner-only (`0700`), its files `0600`.
 - Status-like tools (payment status, order tracking, carts, OTP) always ask the service
   instead of reusing a cached answer.
 
 ### Known risks
 
-- The app trusts each service's own read-only labels. A service that mislabelled a
-  write tool as read-only would bypass the approval gate.
+- The local allowlists must be reviewed when providers change tool semantics. A compromised
+  provider or local process remains outside the approval gate's protection.
 - Text from menus or product listings could try to steer Claude; anything that changes
   your account still needs your approval.
 - When you log in to Blinkit from chat, the OTP passes through Claude and the approval
@@ -665,6 +671,24 @@ only as keyed hashes. The key lives in the **macOS Keychain** (item "food-consol
 keychain is available. If the key is lost the cache is simply treated as empty. Tool lists
 (public descriptions of each service's tools) are stored in plain text.
 
+- **Refreshes preserve your history.** Token bytes, expiry times, config formatting,
+  read-only policies and enabling another service do not reset orders, usage or picks.
+  The first upgrade preserves existing encrypted history. Legacy `orders.json` is imported
+  only when there are no saved orders or archived profiles, and deleted only after a successful
+  import. Otherwise the database and export remain intact. Only disposable, previously unscoped tool responses
+  are refreshed on that upgrade.
+- **Account changes isolate private data.** A changed stable OAuth subject or an existing
+  service’s credential directory/endpoint starts a new local account generation. A changed Blinkit phone number also starts a new generation. Explicit
+  provider logout or `food-auth login --force` does the same. Previous private data is
+  retained in encrypted `account_archives` in the database, not served to the new account;
+  running sessions stop and require restart. `food-cache clear all` also deletes archives.
+  Forced re-login currently archives every service's history even for the same account;
+  those archives are not automatically restored on re-login or switching back.
+  Opaque tokens cannot reveal which account owns them: switch those accounts through
+  `food-auth logout` / `login --force`, rather than replacing token files manually. Separate
+  installations remain the easiest way to keep independently accessible account histories.
+  The owner-only `account-scope.json` stores random generations and hashed identity hints,
+  never access tokens; OAuth claims are used only for partitioning, never to authenticate.
 - **Read-only results are cached.** An identical read within `--cache-ttl` seconds
   (default 60; `0` = fallback only) is answered locally.
 - **Fallback when a service is unavailable.** If a service is offline, rate-limited
@@ -706,20 +730,20 @@ uv run food-cache clear all --forget-key     # also delete the database and its 
 
 ### `mcp_config.json`
 
-Server definitions, in the same `mcpServers` format as Claude Desktop, plus four extras:
+Server definitions, in the same `mcpServers` format as Claude Desktop, plus local read/operation/payment policies:
 
 ```jsonc
 {
   "mcpServers": {
     "zomato-mcp": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote@0.17.1", "https://mcp-server.zomato.com/mcp"],
-      // Only for servers that don't label their tools: the tools allowed to run without asking.
+      "command": "node",
+      "args": ["${mcp_remote}", "https://mcp-server.zomato.com/mcp"],
+      // Local allowlist for every server: the tools allowed to run without asking.
       "readOnlyTools": ["get_order_history", "get_saved_addresses_for_user", "..."]
     },
     "zepto-mcp": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote@0.17.1", "https://mcp.zepto.co.in/mcp"],
+      "command": "node",
+      "args": ["${mcp_remote}", "https://mcp.zepto.co.in/mcp"],
       // Tools never offered to Claude or the Actions tab (here: ways to pay without your UPI PIN).
       "blockedTools": ["create_upi_reserve_pay_order", "create_wallet_order"]
     },
@@ -735,7 +759,8 @@ Server definitions, in the same `mcpServers` format as Claude Desktop, plus four
 ```
 
 `--server <key>` (repeatable) picks servers from this file; `--config <path>` uses another
-file.
+file. `${mcp_remote}` resolves to the locked package in `node_modules` beside the config;
+install it with `npm ci --ignore-scripts` before starting the app.
 
 Requests to Claude Opus enable server-side refusal fallback (`fallbacks: "default"`): if
 the model declines a request for safety reasons, the API retries it on a fallback model.
@@ -795,7 +820,8 @@ src/food_console/
   store.py           encrypted SQLite cache (food-cache)
   stats.py           order-history extraction schema and all Stats metrics
   nutrition.py       dish picker: candidate schema, listed-nutrition parser, checks, ranking
-  payments.py        payment cards: UPI QR from payment requests, QR images, payment links
+  payments.py        reviewed structured UPI adapters and bounded QR rendering
+  credentials.py     account-change detection for private caches
   usage.py           token accounting per run: totals, cost at list prices, per-day, per-activity, per-model
   router.py          model routing: task routes, Haiku classifier, in-conversation ratchet
   web.py             web UI server (food-ui)
@@ -807,7 +833,7 @@ mcp_config.json      MCP server definitions
 
 ### Adding a service
 
-1. Add the server to `mcp_config.json` (and `readOnlyTools` if it doesn't label its tools).
+1. Add the server to `mcp_config.json` (with a reviewed `readOnlyTools` allowlist).
 2. Add a `Provider` and its brand in `mcp_bridge.py`, and an `APPS` entry in `auth.py`.
 3. Add it to `PLATFORMS` / `COMPARE_GROUPS` and the order schema in `stats.py`.
 4. Add its colour and labels to the maps in `static/index.html`.

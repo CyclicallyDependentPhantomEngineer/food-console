@@ -1,0 +1,12 @@
+{
+  "name": "food-console-mcp-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Locked local MCP transport for Food Console",
+  "engines": {
+    "node": ">=20.18.1"
+  },
+  "dependencies": {
+    "mcp-remote": "0.17.1"
+  }
+}

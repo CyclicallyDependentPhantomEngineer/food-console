@@ -26,8 +26,14 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 
+from .credentials import AccountChanged
 from .payments import extract as extract_payments
 from .payments import for_model as payments_for_model
+from .payments import swiggy_cart
+
+MAX_TOOL_RESULT_BYTES = 2_000_000
+MAX_TOOL_ARGS_BYTES = 64_000
+TOOL_TIMEOUT = 120
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "mcp_config.json"
 
@@ -104,10 +110,17 @@ def load_server_params(server: str, config_path: Path = DEFAULT_CONFIG) -> Stdio
     entry = config["mcpServers"][server]
     # "${python}" = this interpreter, for servers that ship inside this package (e.g. Blinkit).
     command = sys.executable if entry["command"] == "${python}" else entry["command"]
+    args = entry.get("args", [])
+    if "${mcp_remote}" in args:
+        proxy = config_path.resolve().parent / "node_modules/mcp-remote/dist/proxy.js"
+        if not proxy.is_file():
+            raise RuntimeError("MCP runtime missing. Run npm ci --ignore-scripts in the config directory first.")
+        args = [str(proxy) if arg == "${mcp_remote}" else arg for arg in args]
     return StdioServerParameters(
         command=command,
-        args=entry.get("args", []),
-        env=entry.get("env"),
+        args=args,
+        env={**{k: os.environ[k] for k in ("MCP_REMOTE_CONFIG_DIR", "BLINKIT_HEADLESS") if k in os.environ},
+             **(entry.get("env") or {})},
     )
 
 
@@ -126,7 +139,7 @@ def default_keys(keys: list[str], config_path: Path = DEFAULT_CONFIG) -> list[st
 
 
 def load_read_only_tools(server: str, config_path: Path = DEFAULT_CONFIG) -> set[str]:
-    """The `readOnlyTools` allowlist for a server that doesn't label its tools (empty if none)."""
+    """The local read-only policy for this server (empty means every tool needs approval)."""
     config = json.loads(config_path.read_text())
     return set(config["mcpServers"][server].get("readOnlyTools", []))
 
@@ -161,7 +174,7 @@ def remote_pids(url: str) -> set[int]:
     """PIDs of running mcp-remote processes for this server URL (npx wrapper and node child)."""
     try:
         out = subprocess.run(
-            ["pgrep", "-f", f"mcp-remote(@[^ ]*)? {re.escape(url)}( |$)"], capture_output=True, text=True, check=False
+            ["pgrep", "-f", rf"(mcp-remote(@[^ ]*)?|mcp-remote/dist/proxy\.js) {re.escape(url)}( |$)"], capture_output=True, text=True, check=False
         ).stdout
     except FileNotFoundError:  # no pgrep on this system
         return set()
@@ -215,6 +228,9 @@ def logout(url: str) -> list[Path]:
     for path in auth_files(url):
         path.unlink()
         removed.append(path)
+    if removed:
+        from .store import clear_private_cache
+        clear_private_cache()
     return removed
 
 
@@ -225,7 +241,15 @@ class BridgedTool:
     claude_name: str
     tool: types.Tool
     session: ClientSession | None  # None: server offline, tool known from the local cache
-    allowlisted: bool = False  # listed in the config's readOnlyTools for this server
+    allowlisted: bool = False  # local policy, never a remote approval grant
+    read_operations: dict[str, Any] = field(default_factory=dict)
+
+    def read_only_for(self, arguments: dict[str, Any]) -> bool:
+        if self.read_only:
+            return True
+        key = self.read_operations.get("argument")
+        value = arguments.get(key) if key else None
+        return isinstance(value, str) and value in self.read_operations.get("values", [])
 
     @property
     def offline(self) -> bool:
@@ -237,16 +261,11 @@ class BridgedTool:
 
     @property
     def read_only(self) -> bool:
-        ann = self.tool.annotations
-        if ann is not None:
-            return bool(ann.read_only_hint)
-        return self.read_only_configured
+        return self.allowlisted
 
     @property
     def read_only_configured(self) -> bool:
-        """For servers that send no annotations (e.g. Zomato): read-only only if the tool is in
-        the config's explicit readOnlyTools allowlist. Names are never trusted on their own."""
-        return self.tool.annotations is None and self.allowlisted
+        return self.allowlisted
 
     @property
     def destructive(self) -> bool:
@@ -347,6 +366,9 @@ class MCPBridge:
         cache_ttl: float = 60,
         read_only_tools: dict[str, set[str]] | None = None,
         blocked_tools: dict[str, set[str]] | None = None,
+        read_only_operations: dict[str, dict] | None = None,
+        payment_tools: dict[str, dict] | None = None,
+        tool_timeout: float = TOOL_TIMEOUT,
     ):
         self._servers = servers
         self._params = dict(servers)
@@ -359,9 +381,14 @@ class MCPBridge:
         # is offline/rate-limited; identical reads within `cache_ttl` seconds skip the server.
         self.store = store
         self.cache_ttl = cache_ttl
-        # {server label: tool names} that may run without approval on unlabelled servers.
+        # Only this local policy can grant an approval exemption.
         self.read_only_tools = read_only_tools or {}
         self.blocked_tools = blocked_tools or {}
+        self.read_only_operations = read_only_operations or {}
+        self.payment_tools = payment_tools or {}
+        self.tool_timeout = tool_timeout
+        self.uncertain_servers: set[str] = set()
+        self._write_locks: dict[str, asyncio.Lock] = {}
         self.sessions: dict[str, ClientSession] = {}
         self.failed: dict[str, str] = {}
         self.tools: dict[str, BridgedTool] = {}
@@ -520,7 +547,7 @@ class MCPBridge:
         tools: dict[str, BridgedTool] = {}
         for label, session in list(self.sessions.items()):
             try:
-                result = await session.list_tools()
+                result = await asyncio.wait_for(session.list_tools(), self.tool_timeout)
             except Exception as exc:  # connection dropped since it was opened
                 self.sessions.pop(label, None)
                 self.failed[label] = f"disconnected: {self._reason(label, exc)}"
@@ -535,7 +562,8 @@ class MCPBridge:
                     print(f"warning: tool name clash on {claude_name}; skipping {label}:{tool.name}", file=sys.stderr)
                     continue
                 tools[claude_name] = BridgedTool(label, tool.name, claude_name, tool, session,
-                                                 tool.name in self.read_only_tools.get(label, ()))
+                                                 tool.name in self.read_only_tools.get(label, ()),
+                                                 self.read_only_operations.get(label, {}).get(tool.name, {}))
             if self.store is not None:
                 self.store.save_tool_defs(label, [t.model_dump(mode="json", by_alias=True, exclude_none=True) for t in result.tools])
         # Offline servers: offer their read-only tools from the cached tool list, so cached
@@ -551,8 +579,9 @@ class MCPBridge:
                         continue
                     raw = f"{label}_{tool.name}" if prefix else tool.name
                     claude_name = _INVALID_NAME_CHARS.sub("_", raw)[:64]
-                    bt = BridgedTool(label, tool.name, claude_name, tool, None, tool.name in self.read_only_tools.get(label, ()))
-                    if bt.read_only and claude_name not in tools:
+                    bt = BridgedTool(label, tool.name, claude_name, tool, None, tool.name in self.read_only_tools.get(label, ()),
+                                                 self.read_only_operations.get(label, {}).get(tool.name, {}))
+                    if (bt.read_only or bt.read_operations) and tool.name not in self.blocked_tools.get(label, ()) and claude_name not in tools:
                         tools[claude_name] = bt
         self.tools = dict(sorted(tools.items(), key=lambda kv: (self._order(kv[1].server), kv[0])))
 
@@ -567,7 +596,42 @@ class MCPBridge:
         r = await self.call_ex(claude_name, arguments)
         return r.text, r.is_error
 
-    async def call_ex(self, claude_name: str, arguments: dict[str, Any]) -> ToolCall:
+    async def prepare_review(self, tool: BridgedTool, arguments: dict[str, Any]) -> ActionReview | None:
+        policy = self.payment_tools.get(tool.server, {}).get(tool.mcp_name, {})
+        if policy.get("adapter") != "swiggy-food":
+            return None
+        if tool.mcp_name != "place_food_order":
+            raise ValueError("Swiggy adapter only supports place_food_order")
+        cart_tool = next((t for t in self.tools.values() if t.server == tool.server
+                          and t.mcp_name == "get_food_cart" and t.read_only), None)
+        if not cart_tool or cart_tool.offline or tool.offline:
+            raise ValueError("A live Swiggy cart is required before reviewing checkout")
+        cart = await self._review_cart(cart_tool, arguments)
+        return ActionReview(tool, cart_tool, copy.deepcopy(arguments), cart, time.monotonic() + 120)
+
+    async def _review_cart(self, tool: BridgedTool, arguments: dict[str, Any]) -> dict:
+        if self.store:
+            self.store.ensure_identity()
+        raw = await asyncio.wait_for(tool.session.call_tool("get_food_cart", {"addressId": arguments["addressId"]}),
+                                     self.tool_timeout)
+        if self.store:
+            self.store.ensure_identity()
+        if len(raw.model_dump_json().encode()) > MAX_TOOL_RESULT_BYTES:
+            raise ValueError("cart response exceeds the size limit")
+        return swiggy_cart(raw, arguments)
+
+    async def call_ex(self, claude_name: str, arguments: dict[str, Any], *,
+                      expected_tool: BridgedTool | None = None, review: ActionReview | None = None) -> ToolCall:
+        tool = self.tools.get(claude_name)
+        if tool and not tool.read_only_for(arguments):
+            # Serialize local cart edits and checkout, including its final live check.
+            lock = self._write_locks.setdefault(tool.server, asyncio.Lock())
+            async with lock:
+                return await self._call_ex(claude_name, arguments, expected_tool=expected_tool, review=review)
+        return await self._call_ex(claude_name, arguments, expected_tool=expected_tool, review=review)
+
+    async def _call_ex(self, claude_name: str, arguments: dict[str, Any], *,
+                       expected_tool: BridgedTool | None = None, review: ActionReview | None = None) -> ToolCall:
         """Run a tool, using the local cache for read-only tools when that helps.
 
         - read-only + identical call within `cache_ttl`: served from cache (no request), except
@@ -579,7 +643,35 @@ class MCPBridge:
         bridged = self.tools.get(claude_name)
         if bridged is None:
             return ToolCall(f"Unknown tool: {claude_name}", True)
-        store, cacheable = self.store, bridged.read_only and self.store is not None
+        if expected_tool is not None and bridged is not expected_tool:
+            return ToolCall("Tool definition changed after review; review the action again.", True)
+        if not isinstance(arguments, dict) or len(json.dumps(arguments, allow_nan=False).encode()) > MAX_TOOL_ARGS_BYTES:
+            return ToolCall("Tool arguments exceed the size limit or are not an object.", True)
+        store = self.store
+        if store is not None:
+            store.ensure_identity()
+        read_only = bridged.read_only_for(arguments)
+        if not read_only and bridged.server in self.uncertain_servers:
+            return ToolCall("A previous action has an uncertain outcome. Fetch live order/payment status before another write.", True)
+        policy = self.payment_tools.get(bridged.server, {}).get(bridged.mcp_name, {})
+        if policy.get("adapter") == "swiggy-food":
+            if (not review or review.used or review.expires <= time.monotonic()
+                    or review.tool is not bridged or review.arguments != arguments
+                    or self.tools.get(review.cart_tool.claude_name) is not review.cart_tool):
+                return ToolCall("Review the current Swiggy cart before placing this order.", True)
+            review.used = True
+            try:
+                current_cart = await self._review_cart(review.cart_tool, arguments)
+                if current_cart != review.cart:
+                    return ToolCall("The cart changed after approval. Review the updated cart before placing the order.", True)
+                if (review.expires <= time.monotonic() or self.tools.get(claude_name) is not bridged
+                        or self.tools.get(review.cart_tool.claude_name) is not review.cart_tool):
+                    return ToolCall("Review expired or tools changed while checking the cart. Review the action again.", True)
+            except AccountChanged:
+                raise
+            except Exception:
+                return ToolCall("Could not recheck the live cart. No order was submitted; review it again when connected.", True)
+        cacheable = read_only and store is not None
         cached = store.get_result(bridged.server, bridged.mcp_name, arguments) if cacheable else None
 
         fresh_ok = self.cache_ttl > 0 and not bridged.offline and not _LIVE_FIRST.search(bridged.mcp_name)
@@ -587,14 +679,43 @@ class MCPBridge:
             return ToolCall(cached.text, False, "cache", cached.fetched_iso)
         if bridged.offline:
             why = self.failed.get(bridged.server, "offline")
-            if cached:
+            if cached and read_only:
                 return self._from_cache(cached, f"{bridged.server} is offline ({why})")
             return ToolCall(f"{bridged.server} is offline ({why}) and there is no cached result for this "
                             "request yet. Tell the user it can't be fetched right now.", True)
         try:
-            raw = await bridged.session.call_tool(bridged.mcp_name, arguments)
+            raw = await asyncio.wait_for(bridged.session.call_tool(bridged.mcp_name, arguments), self.tool_timeout)
+            # A write has already happened. Invalidate before parsing or presentation.
+            if not read_only and store is not None:
+                store.invalidate(bridged.server)
+            if store is not None:
+                store.ensure_identity()
+            if len(raw.model_dump_json().encode()) > MAX_TOOL_RESULT_BYTES:
+                if read_only:
+                    return ToolCall("Tool result exceeds the size limit.", True)
+                self.uncertain_servers.add(bridged.server)
+                return ToolCall("Action returned an oversized result. Check order/payment status before any retry.",
+                                False, outcome_uncertain=True)
             text, is_error = _render_result(raw)
+        except asyncio.CancelledError:
+            if not read_only:
+                self.uncertain_servers.add(bridged.server)
+                if store is not None:
+                    with contextlib.suppress(AccountChanged):
+                        store.invalidate(bridged.server)
+            raise
+        except AccountChanged:
+            if not read_only:
+                self.uncertain_servers.add(bridged.server)
+                return ToolCall("Account credentials changed during the action. It may have succeeded; restart and check order/payment status before retrying.", False, outcome_uncertain=True)
+            raise
         except Exception as exc:
+            if not read_only:
+                self.uncertain_servers.add(bridged.server)
+                if store is not None:
+                    store.invalidate(bridged.server)
+                return ToolCall(f"Action outcome unknown ({type(exc).__name__}). Check order/payment status before retrying.",
+                                False, outcome_uncertain=True)
             if cached:
                 return self._from_cache(cached, f"the request to {bridged.server} failed ({exc})")
             raise
@@ -603,15 +724,20 @@ class MCPBridge:
                 return self._from_cache(cached, f"{bridged.server} is rate-limiting requests")
             return ToolCall(text, True)
         payments: list[dict[str, Any]] = []
-        if not bridged.read_only and not is_error:
-            # Account-changing tools only: a QR or payment link the server meant for its widget.
-            payments = extract_payments(raw)
-            text = payments_for_model(text, payments)
-        if not is_error and store is not None:
-            if cacheable:
-                store.put_result(bridged.server, bridged.mcp_name, arguments, text)
-            elif not bridged.read_only:
-                store.invalidate(bridged.server)
+        if not read_only and not is_error:
+            policy = self.payment_tools.get(bridged.server, {}).get(bridged.mcp_name)
+            if policy:
+                try:
+                    payments = extract_payments(raw, policy=policy, arguments=arguments,
+                                                reviewed_cart=review.cart if review else None)
+                    text = payments_for_model(text, payments)
+                except Exception:
+                    # Never turn a completed order into a tool failure or a retry.
+                    text += "\n[Action returned; payment display failed validation. Check status and complete payment in the provider app. Do not repeat the action.]"
+        if not is_error and cacheable:
+            store.put_result(bridged.server, bridged.mcp_name, arguments, text)
+        if not is_error and read_only and re.search(r"status|track|order.*history|orders|order_detail", bridged.mcp_name, re.I):
+            self.uncertain_servers.discard(bridged.server)
         return ToolCall(text, is_error, payments=payments)
 
     @staticmethod
@@ -627,11 +753,22 @@ _RATE_LIMIT = re.compile(r"\b429\b|too many requests|rate[ -]?limit", re.I)
 
 
 @dataclass
+class ActionReview:
+    tool: BridgedTool
+    cart_tool: BridgedTool
+    arguments: dict[str, Any]
+    cart: dict[str, Any]
+    expires: float
+    used: bool = False
+
+
+@dataclass
 class ToolCall:
     text: str
     is_error: bool
     source: str = "live"  # live | cache (fresh hit) | cache-fallback (server unavailable)
     cached_at: str | None = None
+    outcome_uncertain: bool = False
     payments: list[dict[str, Any]] = field(default_factory=list)  # QR codes / payment links to show the user
 
 

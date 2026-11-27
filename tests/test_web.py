@@ -1,3 +1,4 @@
+from conftest import FAKE_READ_ONLY
 """Web UI guards: token, Host header, and confirmation before account-changing tools."""
 import argparse
 import asyncio
@@ -22,7 +23,7 @@ def client():
     """App wired to a fake MCP server; the MCP session lives on a background event loop."""
     loop = asyncio.new_event_loop()
     threading.Thread(target=loop.run_forever, daemon=True).start()
-    bridge = MCPBridge([("food", FAKE), ("zomato", FAKE)])
+    bridge = MCPBridge([("food", FAKE), ("zomato", FAKE)], read_only_tools=FAKE_READ_ONLY)
     ready, stop = threading.Event(), asyncio.Event()
 
     async def hold():  # enter and exit the bridge in the same task (anyio requires it)
@@ -38,7 +39,7 @@ def client():
     state.chat = state.new_agent()
     # Route tool calls onto the loop that owns the MCP session (the test client runs its own loop).
     real_call_ex = bridge.call_ex
-    bridge.call_ex = lambda name, args: asyncio.wrap_future(asyncio.run_coroutine_threadsafe(real_call_ex(name, args), loop))
+    bridge.call_ex = lambda name, args, **kw: asyncio.wrap_future(asyncio.run_coroutine_threadsafe(real_call_ex(name, args, **kw), loop))
 
     with TestClient(build_app(state), base_url=f"http://127.0.0.1:{PORT}") as c:
         r = c.get(f"/login?t={state.login_token}", follow_redirects=False)
@@ -106,7 +107,8 @@ def test_read_only_tool_runs(client):
 
 def test_changing_tool_needs_confirm(client):
     assert client.post("/api/tools/zomato_place_order", json={"args": {"cart_id": "c1"}}).status_code == 409
-    r = client.post("/api/tools/zomato_place_order", json={"args": {"cart_id": "c1"}, "confirm": True})
+    review = client.post("/api/tools/zomato_place_order", json={"args": {"cart_id": "c1"}}).json()
+    r = client.post("/api/tools/zomato_place_order", json={"args": {"cart_id": "c1"}, "confirm": True, "approval_id": review["approval_id"]})
     assert r.json() == {"result": "placed c1", "is_error": False, "source": "live", "cached_at": None, "payments": []}
 
 

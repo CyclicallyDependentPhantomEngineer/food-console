@@ -25,7 +25,9 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from .credentials import AccountChanged, credential_fingerprint
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -129,7 +131,8 @@ class CachedResult:
 
 
 class Store:
-    def __init__(self, path: Path | None = None, key: bytes | None = None):
+    def __init__(self, path: Path | None = None, key: bytes | None = None, *,
+                 credential_source: Callable[[], str] | None = None):
         self.path = Path(path or DB_PATH)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(self.path.parent, 0o700)  # .cache holds personal data: owner-only
@@ -143,7 +146,72 @@ class Store:
         # Separate HMAC key derived from the encryption key, for lookup hashes.
         self._mac_key = hashlib.sha256(b"food-console/lookup/" + self._key).digest()
         self._upgrade()
+        self._credential_source = credential_source or credential_fingerprint
+        self._identity = self._mac(self._credential_source())
+        self._stale_identity = False
+        self.db.execute("CREATE TABLE IF NOT EXISTS credential_scope (slot INTEGER PRIMARY KEY, identity TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS account_archives (identity TEXT PRIMARY KEY, data_enc TEXT NOT NULL)")
+        # Upgrade the old token-byte scope in place, preserving the owner's history.
+        # Slot 2 is the stable-generation format marker; slot 1 remains the active scope.
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            if not self.db.execute("SELECT 1 FROM credential_scope WHERE slot=2").fetchone():
+                self.db.execute("INSERT OR REPLACE INTO credential_scope VALUES (1, ?)", (self._identity,))
+                self.db.execute("INSERT OR REPLACE INTO credential_scope VALUES (2, 'stable-generation-v1')")
+                self.db.execute("DELETE FROM tool_results")  # refresh disposable, previously unscoped responses
+        self._bind_identity(self._identity)
         self._migrate_legacy_json()
+
+    def _migrate_legacy_json(self) -> None:
+        """Import an old export only when it cannot replace existing history."""
+        legacy = self.path.with_name("orders.json")
+        if (not legacy.exists()
+                or self.db.execute("SELECT 1 FROM orders_enc LIMIT 1").fetchone()
+                or self.db.execute("SELECT 1 FROM account_archives LIMIT 1").fetchone()):
+            # A skipped export stays intact. In particular, an empty new account
+            # must not inherit a leftover export belonging to an archived account.
+            return
+        try:
+            self.save_orders(json.loads(legacy.read_text()))
+        except (OSError, ValueError):
+            return
+        legacy.unlink()  # only after successful encrypted import
+
+    def _bind_identity(self, identity: str, *, expected: str | None = None) -> None:
+        # Account switches archive private data; refreshes never arrive here.
+        tables = ("tool_results", "orders_enc", "meta_enc", "picks_enc", "usage_runs")
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute("SELECT identity FROM credential_scope WHERE slot=1").fetchone()
+            if expected is not None and (not row or row[0] != expected):
+                raise AccountChanged()
+            if row is None or row[0] != identity:
+                if row:
+                    snapshot = {t: self.db.execute(f"SELECT * FROM {t}").fetchall() for t in tables}
+                    self.db.execute("INSERT OR REPLACE INTO account_archives VALUES (?, ?)",
+                                    (row[0], self._enc(json.dumps(snapshot))))
+                for table in tables:
+                    self.db.execute(f"DELETE FROM {table}")
+                saved = self.db.execute("SELECT data_enc FROM account_archives WHERE identity=?", (identity,)).fetchone()
+                if saved:
+                    snapshot = json.loads(self._dec(saved[0]))
+                    for table in tables:
+                        for values in snapshot.get(table, []):
+                            self.db.execute(f"INSERT INTO {table} VALUES ({','.join('?' for _ in values)})", values)
+                    self.db.execute("DELETE FROM account_archives WHERE identity=?", (identity,))
+                self.db.execute("INSERT OR REPLACE INTO credential_scope VALUES (1, ?)", (identity,))
+
+    def ensure_identity(self) -> None:
+        row = self.db.execute("SELECT identity FROM credential_scope WHERE slot=1").fetchone()
+        if self._stale_identity or not row or row[0] != self._identity:
+            self._stale_identity = True
+            raise AccountChanged()
+        current = self._mac(self._credential_source())
+        if current != self._identity:
+            self._stale_identity = True
+            self._bind_identity(current, expected=self._identity)
+        if self._stale_identity:
+            raise AccountChanged()
 
     def close(self) -> None:
         self.db.close()
@@ -163,6 +231,7 @@ class Store:
 
     # ---- tool results ----
     def get_result(self, server: str, tool: str, args: dict[str, Any]) -> CachedResult | None:
+        self.ensure_identity()
         row = self.db.execute(
             "SELECT result_enc, fetched_at FROM tool_results WHERE server=? AND tool=? AND args_hash=?",
             (server, tool, self.args_hash(args)),
@@ -175,6 +244,7 @@ class Store:
             return None
 
     def put_result(self, server: str, tool: str, args: dict[str, Any], result: str) -> None:
+        self.ensure_identity()
         self.db.execute(
             "INSERT OR REPLACE INTO tool_results VALUES (?, ?, ?, ?, ?, ?)",
             (server, tool, self.args_hash(args), self._enc(json.dumps(args or {}, sort_keys=True, ensure_ascii=False)),
@@ -183,10 +253,12 @@ class Store:
 
     def invalidate(self, server: str) -> int:
         """Drop a server's cached results (after something on it changed, e.g. the cart)."""
+        self.ensure_identity()
         return self.db.execute("DELETE FROM tool_results WHERE server=?", (server,)).rowcount
 
     # ---- tool definitions (public API descriptions, not personal) ----
     def save_tool_defs(self, server: str, defs: list[dict[str, Any]]) -> None:
+        self.ensure_identity()
         now = time.time()
         with self.db:
             self.db.execute("BEGIN")
@@ -197,6 +269,7 @@ class Store:
             )
 
     def load_tool_defs(self, server: str) -> list[dict[str, Any]]:
+        self.ensure_identity()
         rows = self.db.execute("SELECT definition FROM tool_defs WHERE server=? ORDER BY name", (server,)).fetchall()
         return [json.loads(r[0]) for r in rows]
 
@@ -207,6 +280,7 @@ class Store:
 
     def save_orders(self, data: dict[str, Any]) -> None:
         """Replace the saved order set with `data["orders"]` (already merged by the caller)."""
+        self.ensure_identity()
         now = time.time()
         rows = [(self._order_id_hash(o, i), self._enc(json.dumps(o, ensure_ascii=False)), now)
                 for i, o in enumerate(data.get("orders", []))]
@@ -219,6 +293,7 @@ class Store:
                     self.db.execute("INSERT OR REPLACE INTO meta_enc VALUES (?, ?)", (key, self._enc(json.dumps(data[key]))))
 
     def load_orders(self) -> dict[str, Any] | None:
+        self.ensure_identity()
         try:
             orders = [json.loads(self._dec(r[0])) for r in self.db.execute("SELECT data_enc FROM orders_enc")]
             meta = {k: json.loads(self._dec(v)) for k, v in self.db.execute("SELECT key, value_enc FROM meta_enc")}
@@ -233,15 +308,18 @@ class Store:
 
     def save_pick(self, data: dict[str, Any]) -> None:
         """Keep the most recent dish-picker result (it includes restaurants near the user)."""
+        self.ensure_identity()
         self.db.execute("INSERT OR REPLACE INTO picks_enc VALUES ('last', ?, ?)",
                         (self._enc(json.dumps(data, ensure_ascii=False)), time.time()))
 
     def save_usage(self, run: dict[str, Any]) -> None:
         """Record one run's token usage (see usage.py)."""
+        self.ensure_identity()
         self.db.execute("INSERT INTO usage_runs (started_at, data_enc) VALUES (?, ?)",
                         (run.get("started_at") or time.time(), self._enc(json.dumps(run, ensure_ascii=False))))
 
     def load_usage(self, since: float | None = None, until: float | None = None, limit: int = 2000) -> list[dict[str, Any]]:
+        self.ensure_identity()
         rows = self.db.execute(
             "SELECT id, data_enc FROM usage_runs WHERE started_at >= ? AND started_at < ? ORDER BY started_at DESC LIMIT ?",
             (since or 0, until or 1e12, limit)).fetchall()
@@ -254,6 +332,7 @@ class Store:
         return out
 
     def load_pick(self) -> dict[str, Any] | None:
+        self.ensure_identity()
         row = self.db.execute("SELECT data_enc FROM picks_enc WHERE slot='last'").fetchone()
         if not row:
             return None
@@ -281,7 +360,7 @@ class Store:
     def clear(self, what: str = "results", server: str | None = None) -> int:
         tables = {"results": ["tool_results"], "tools": ["tool_defs"], "orders": ["orders_enc", "meta_enc"],
                   "picks": ["picks_enc"], "usage": ["usage_runs"],
-                  "all": ["tool_results", "tool_defs", "orders_enc", "meta_enc", "picks_enc", "usage_runs"]}[what]
+                  "all": ["tool_results", "tool_defs", "orders_enc", "meta_enc", "picks_enc", "usage_runs", "account_archives"]}[what]
         n = 0
         with self.db:
             self.db.execute("BEGIN")
@@ -330,16 +409,16 @@ class Store:
         if old_results or "orders" in tables or "meta" in tables:
             self.db.execute("VACUUM")  # rewrite the file so the old plaintext pages are gone
 
-    def _migrate_legacy_json(self) -> None:
-        """One-time import of an old plaintext orders.json next to the database, then delete it."""
-        legacy = self.path.with_name("orders.json")
-        if not legacy.exists() or self.db.execute("SELECT 1 FROM orders_enc LIMIT 1").fetchone():
-            return
-        try:
-            self.save_orders(json.loads(legacy.read_text()))
-        except (OSError, ValueError):
-            return
-        legacy.unlink()  # its contents are now stored encrypted
+def clear_private_cache() -> None:
+    """Start a separate account generation on explicit provider logout.
+
+    Old encrypted history is archived, never silently deleted by a login refresh.
+    """
+    from .credentials import credential_fingerprint as rotate_scope
+    rotate_scope(rotate=True)
+    if DB_PATH.exists():
+        s = Store()
+        s.close()
 
 
 def main() -> None:

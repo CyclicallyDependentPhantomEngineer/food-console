@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -14,6 +15,7 @@ from typing import Any, Awaitable, Callable
 import anthropic
 
 from .mcp_bridge import PROVIDERS, BridgedTool, MCPBridge, Provider
+from .credentials import AccountChanged
 
 MODEL = os.environ.get("ZOMATO_CHAT_MODEL", "claude-opus-5-5")
 EFFORT = os.environ.get("ZOMATO_CHAT_EFFORT", "medium")
@@ -130,20 +132,21 @@ class OrderAgent:
         # When set to a list, every successful tool result is appended as
         # {"server", "tool", "text"} (used by the dish picker to read raw nutrition data).
         self.tool_log: list[dict[str, str]] | None = None
+        self.mutation_uncertain = False
         # Optional check on a tool call's arguments; a returned message refuses the call
         # (the dish picker uses it to allow only the user's craving as a search keyword).
         self.arg_guard: Callable[[BridgedTool, dict[str, Any]], str | None] | None = None
 
-    def needs_approval(self, tool: BridgedTool) -> bool:
-        # Fail closed: anything not known to be read-only (server annotation, or the config's
-        # readOnlyTools allowlist for servers that send no annotations) needs an explicit "yes".
-        # Guessing "dangerous" tools by name missed e.g. Zomato's bind_user_number.
-        return not tool.read_only
+    def needs_approval(self, tool: BridgedTool, args: dict[str, Any] | None = None) -> bool:
+        # Only local policy can grant an approval exemption; remote hints cannot.
+        return not tool.read_only_for(args or {})
 
     def _tools(self) -> list[dict[str, Any]]:
         return [t.to_claude() for t in self.mcp.tools.values() if self.tool_filter is None or self.tool_filter(t)]
 
     async def _create(self, output_format: dict[str, Any] | None, max_tokens: int):
+        if self.mcp.store is not None:
+            self.mcp.store.ensure_identity()
         kwargs: dict[str, Any] = dict(
             model=self.model,
             max_tokens=max_tokens,
@@ -165,7 +168,7 @@ class OrderAgent:
 
     async def _run_tool(self, block) -> dict[str, Any]:
         tool = self.mcp.tools.get(block.name)
-        args = block.input if isinstance(block.input, dict) else {}
+        args = copy.deepcopy(block.input) if isinstance(block.input, dict) else {}
         result: dict[str, Any] = {"type": "tool_result", "tool_use_id": block.id}
 
         if tool is None or (self.tool_filter is not None and not self.tool_filter(tool)):
@@ -173,20 +176,34 @@ class OrderAgent:
         if self.arg_guard is not None and (refusal := self.arg_guard(tool, args)):
             self.on_event({"type": "tool_declined", "tool": tool.label, "reason": refusal})
             return {**result, "content": refusal, "is_error": True}
-        if self.needs_approval(tool):
+        review = None
+        if self.needs_approval(tool, args):
+            if self.mutation_uncertain:
+                return {**result, "content": "A previous action has an uncertain outcome. Check its status and start a new conversation before another write.", "is_error": True}
             if not self.allow_orders:
                 return {**result, "content": "Blocked: ordering is disabled in this session.", "is_error": True}
-            if not await self.approve(tool, args):
+            try:
+                review = await self.mcp.prepare_review(tool, args)
+            except AccountChanged:
+                raise
+            except Exception as exc:
+                return {**result, "content": f"Could not prepare checkout review: {exc}. No order was submitted.", "is_error": True}
+            shown = {"arguments": args, "reviewed_cart": review.cart} if review else args
+            if not await self.approve(tool, copy.deepcopy(shown)):
                 self.on_event({"type": "tool_declined", "tool": tool.label})
                 return {**result, "content": "The user declined this action.", "is_error": True}
 
         self.on_event({"type": "tool_call", "tool": tool.label, "args": args, "verbose": self.verbose})
         source = "live"
         try:
-            r = await self.mcp.call_ex(block.name, args)
+            r = await self.mcp.call_ex(block.name, args, expected_tool=tool, review=review)
             text, is_error, source = r.text, r.is_error, r.source
+            if r.outcome_uncertain:
+                self.mutation_uncertain = True
             if r.payments:
                 self.on_event({"type": "payment", "tool": tool.label, "items": r.payments})
+        except AccountChanged:
+            raise
         except Exception as exc:  # surface MCP/transport failures to the model, don't crash the chat
             text, is_error = f"Tool call failed: {exc}", True
         self.on_event({"type": "tool_result", "tool": tool.label, "is_error": is_error, "chars": len(text), "source": source})
@@ -201,6 +218,8 @@ class OrderAgent:
         self, user_text: str, *, output_format: dict[str, Any] | None = None, max_tokens: int = 16000
     ) -> str:
         """Send one user message, run tools until Claude finishes, return the final text."""
+        if self.mcp.store is not None:
+            self.mcp.store.ensure_identity()
         started = time.time()
         if not self.messages:
             self.tier = None  # new conversation: routing starts from the bottom again
@@ -218,6 +237,9 @@ class OrderAgent:
                          "router": decision.usage} if decision else {})}
         try:
             return await self._send(user_text, output_format=output_format, max_tokens=max_tokens)
+        except AccountChanged:
+            self.messages.clear()
+            raise
         finally:
             run, self._run = self._run, None
             run["ms"] = round((time.time() - started) * 1000)

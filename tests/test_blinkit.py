@@ -1,3 +1,4 @@
+from conftest import FAKE_READ_ONLY
 """Blinkit: parsers, encrypted session, tool labels and launch through the bridge (no browser)."""
 import asyncio
 import os
@@ -78,7 +79,7 @@ def test_server_starts_through_the_bridge_without_a_browser():
     from food_console.mcp_bridge import MCPBridge, load_server_params
 
     async def run():
-        async with MCPBridge([("blinkit", load_server_params("blinkit-mcp"))], connect_timeout=60) as mcp:
+        async with MCPBridge([("blinkit", load_server_params("blinkit-mcp"))], connect_timeout=60, read_only_tools=FAKE_READ_ONLY) as mcp:
             agent = OrderAgent.__new__(OrderAgent)
             asks = {t.mcp_name for t in mcp.tools.values() if agent.needs_approval(t)}
             assert {"place_order", "checkout", "add_to_cart", "send_otp", "verify_otp", "logout"} <= asks
