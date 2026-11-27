@@ -12,6 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .agent import MODEL, OrderAgent, ask_yes_no
+from .router import Router
 from .store import Store
 from .mcp_bridge import (
     DEFAULT_CONFIG,
@@ -134,7 +135,10 @@ async def _main(args: argparse.Namespace) -> int:
             verbose=args.verbose,
             profile=args.profile,
         )
-        print(f"Connected to {', '.join(mcp.sessions)}. {len(mcp.tools)} tools. Model: {MODEL}")
+        agent.usage_kind, agent.on_usage = f"cli:{args.command or 'chat'}", store.save_usage
+        agent.router, agent.model_override = Router.from_env(), args.model
+        print(f"Connected to {', '.join(mcp.sessions)}. {len(mcp.tools)} tools. "
+              f"Model: {'auto routing' if args.model == 'auto' and agent.router.enabled else args.model}")
 
         if args.command == "tools":
             _print_tools(mcp, agent)
@@ -196,6 +200,8 @@ def _run(default_provider: str) -> None:
         action="append",
         help="server key in mcpServers to use instead of the provider's set (repeatable), e.g. swiggy-instamart",
     )
+    p.add_argument("--model", default="auto", choices=["auto", "haiku", "sonnet", "opus"],
+                   help="auto (default): route each request to Haiku, Sonnet or Opus; or force one model")
     p.add_argument("--no-orders", action="store_true", help="block order/booking/payment tools (analysis only)")
     p.add_argument("-v", "--verbose", action="store_true", help="print tool arguments")
     sub = p.add_subparsers(dest="command")

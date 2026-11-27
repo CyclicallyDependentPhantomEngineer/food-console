@@ -59,6 +59,11 @@ CREATE TABLE IF NOT EXISTS meta_enc (
     key         TEXT PRIMARY KEY,
     value_enc   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS usage_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at  REAL NOT NULL,
+    data_enc    TEXT NOT NULL      -- the run (incl. your message text), encrypted
+);
 CREATE TABLE IF NOT EXISTS picks_enc (
     slot        TEXT PRIMARY KEY,  -- "last": the most recent dish pick
     data_enc    TEXT NOT NULL,
@@ -229,6 +234,23 @@ class Store:
         self.db.execute("INSERT OR REPLACE INTO picks_enc VALUES ('last', ?, ?)",
                         (self._enc(json.dumps(data, ensure_ascii=False)), time.time()))
 
+    def save_usage(self, run: dict[str, Any]) -> None:
+        """Record one run's token usage (see usage.py)."""
+        self.db.execute("INSERT INTO usage_runs (started_at, data_enc) VALUES (?, ?)",
+                        (run.get("started_at") or time.time(), self._enc(json.dumps(run, ensure_ascii=False))))
+
+    def load_usage(self, since: float | None = None, until: float | None = None, limit: int = 2000) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT id, data_enc FROM usage_runs WHERE started_at >= ? AND started_at < ? ORDER BY started_at DESC LIMIT ?",
+            (since or 0, until or 1e12, limit)).fetchall()
+        out = []
+        for rid, enc in rows:
+            try:
+                out.append({"id": rid, **json.loads(self._dec(enc))})
+            except InvalidToken:
+                continue
+        return out
+
     def load_pick(self) -> dict[str, Any] | None:
         row = self.db.execute("SELECT data_enc FROM picks_enc WHERE slot='last'").fetchone()
         if not row:
@@ -256,8 +278,8 @@ class Store:
 
     def clear(self, what: str = "results", server: str | None = None) -> int:
         tables = {"results": ["tool_results"], "tools": ["tool_defs"], "orders": ["orders_enc", "meta_enc"],
-                  "picks": ["picks_enc"],
-                  "all": ["tool_results", "tool_defs", "orders_enc", "meta_enc", "picks_enc"]}[what]
+                  "picks": ["picks_enc"], "usage": ["usage_runs"],
+                  "all": ["tool_results", "tool_defs", "orders_enc", "meta_enc", "picks_enc", "usage_runs"]}[what]
         n = 0
         with self.db:
             self.db.execute("BEGIN")
@@ -319,16 +341,16 @@ class Store:
 
 
 def main() -> None:
-    """`food-cache info` / `food-cache clear [results|tools|orders|picks|all] [--server NAME]`."""
+    """`food-cache info` / `food-cache clear [results|tools|orders|picks|usage|all] [--server NAME]`."""
     import argparse
 
     p = argparse.ArgumentParser(prog="food-cache", description="Inspect or clear the local encrypted cache.")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("info", help="show what is cached")
     c = sub.add_parser("clear", help="delete cached data")
-    c.add_argument("what", nargs="?", default="results", choices=["results", "tools", "orders", "picks", "all"],
+    c.add_argument("what", nargs="?", default="results", choices=["results", "tools", "orders", "picks", "usage", "all"],
                    help="results (default): cached tool responses; tools: cached tool lists; "
-                        "orders: saved order history used by Stats; picks: last dish pick; all: everything")
+                        "orders: saved order history used by Stats; picks: last dish pick; usage: token usage history; all: everything")
     c.add_argument("--server", help="only this server label (zomato, food, instamart, dineout, district, zepto, blinkit); results/tools only")
     c.add_argument("--forget-key", action="store_true",
                    help="with `all`: also delete the database file and its key from the keychain")

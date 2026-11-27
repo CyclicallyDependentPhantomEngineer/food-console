@@ -211,3 +211,19 @@ def test_pick_address_list_and_only_saved_addresses_accepted(client, monkeypatch
     ok = client.post("/api/pick", json={"address_server": "zomato", "address_id": "zomato-1"})
     done = [json.loads(line) for line in ok.text.splitlines() if line.strip()][-1]
     assert "address id is zomato-1" in seen["address_detail"] and done["address"]["label"] == "Home"
+
+
+def test_usage_api(client, tmp_path):
+    from cryptography.fernet import Fernet
+
+    from food_console.store import Store
+
+    client.state.store = Store(tmp_path / "food.db", key=Fernet.generate_key())
+    assert client.get("/api/usage").json()["runs"] == []
+    client.state.store.save_usage({"kind": "pick", "label": "Pick · lean", "started_at": 1_790_000_000.0, "ms": 10,
+                                   "tools_offered": 3, "rounds": [{"model": "claude-opus-5-5", "input": 1000, "output": 100,
+                                                                   "cache_read": 0, "cache_write": 0}], "tools": []})
+    d = client.get("/api/usage").json()
+    assert d["total"]["runs"] == 1 and d["runs"][0]["kind"] == "pick" and d["runs"][0]["cost_usd"] == 0.006
+    assert client.get("/api/usage?from=2099-01-01").json()["runs"] == []
+    assert client.post("/api/usage/clear", json={}).json()["cleared"] == 1

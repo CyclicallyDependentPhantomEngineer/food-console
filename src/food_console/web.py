@@ -18,7 +18,7 @@ import secrets
 import sys
 import uuid
 import webbrowser
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -34,6 +34,8 @@ from starlette.routing import Route
 from . import _use_ant_profile
 from .agent import MODEL, OrderAgent
 from .store import Store
+from .router import Router, tier_of
+from .usage import PRICES, aggregate, summarize
 from .mcp_bridge import (
     DEFAULT_CONFIG,
     PROVIDERS,
@@ -77,6 +79,7 @@ class AppState:
         self.sessions: set[str] = set()
         self.mcp: MCPBridge | None = None
         self.store: Store | None = None
+        self.router = Router.from_env()
         self.chat: OrderAgent | None = None
         self.chat_lock = asyncio.Lock()
         self.stats_lock = asyncio.Lock()
@@ -111,10 +114,14 @@ class AppState:
         finally:
             self.pending.pop(approval_id, None)
 
-    def new_agent(self, **kwargs) -> OrderAgent:
+    def new_agent(self, *, kind: str = "chat", label: str | None = None, **kwargs) -> OrderAgent:
         assert self.mcp is not None
-        return OrderAgent(self.mcp, self.approve, provider=PROVIDERS["all"], profile=self.args.profile,
-                          on_event=self.emit, **kwargs)
+        agent = OrderAgent(self.mcp, self.approve, provider=PROVIDERS["all"], profile=self.args.profile,
+                           on_event=self.emit, **kwargs)
+        agent.usage_kind, agent.usage_label, agent.router = kind, label, self.router
+        if self.store is not None:
+            agent.on_usage = self.store.save_usage
+        return agent
 
 
 def _tool_info(t: BridgedTool, agent: OrderAgent) -> dict[str, Any]:
@@ -186,7 +193,9 @@ def build_app(state: AppState) -> Starlette:
     async def status(request: Request) -> Response:
         mcp = state.mcp
         return JSONResponse({
-            "model": MODEL,
+            "model": "auto routing" if state.router.enabled else state.router.off_model,
+            "router": {"enabled": state.router.enabled, "models": state.router.models,
+                       "classifier": state.router.classifier_model},
             "connected": list(mcp.sessions) if mcp else [],
             "failed": mcp.failed if mcp else {},
             "tool_count": len(mcp.tools) if mcp else 0,
@@ -226,14 +235,19 @@ def build_app(state: AppState) -> Starlette:
 
     async def chat(request: Request) -> Response:
         assert state.chat
-        message = ((await request.json()).get("message") or "").strip()
+        body = await request.json()
+        message = (body.get("message") or "").strip()
         if not message:
             return JSONResponse({"error": "empty message"}, status_code=400)
+        choice = body.get("model") or "auto"
+        if tier_of(choice) is None:
+            return JSONResponse({"error": "model must be auto, haiku, sonnet or opus"}, status_code=400)
         if state.busy():
             return JSONResponse({"error": "busy: another request is running"}, status_code=409)
 
         async def work():
             async with state.chat_lock:
+                state.chat.model_override = choice
                 return {"text": await state.chat.send(message), "usage": state.chat.usage}
 
         return StreamingResponse(_stream(state, work), media_type="application/x-ndjson")
@@ -310,7 +324,8 @@ def build_app(state: AppState) -> Starlette:
         async def work():
             async with state.stats_lock:
                 # Fresh agent: read-only history tools only, so nothing can change the account.
-                agent = state.new_agent(tool_filter=history_tool_filter, allow_orders=False)
+                agent = state.new_agent(kind="stats", label="Stats refresh", tool_filter=history_tool_filter,
+                                        allow_orders=False)
                 fresh = await extract_orders(agent, limit=state.args.history_limit)
                 # Providers only return recent orders, so keep what earlier refreshes found.
                 data = merge_orders(load_orders(), fresh)
@@ -381,7 +396,8 @@ def build_app(state: AppState) -> Starlette:
         async def work():
             async with state.pick_lock:
                 # Fresh agent restricted to read-only search/menu tools: it can't touch carts or orders.
-                agent = state.new_agent(tool_filter=pick_tool_filter(servers), allow_orders=False)
+                label = " · ".join(x for x in ("Pick", goal["preset"], query, chosen["label"] if chosen else "") if x)
+                agent = state.new_agent(kind="pick", label=label, tool_filter=pick_tool_filter(servers), allow_orders=False)
                 result = await pick_dishes(agent, goal, query=query, platforms=names, address_detail=address_detail)
                 result["platform"] = platform
                 if chosen:
@@ -391,6 +407,22 @@ def build_app(state: AppState) -> Starlette:
                 return result
 
         return StreamingResponse(_stream(state, work), media_type="application/x-ndjson")
+
+    async def usage(request: Request) -> Response:
+        try:
+            start, end = _range(request)
+        except ValueError:
+            return JSONResponse({"error": "dates must be YYYY-MM-DD"}, status_code=400)
+        if state.store is None:
+            return JSONResponse({"runs": [], **aggregate([]), "prices": PRICES})
+        since = datetime.combine(start, datetime.min.time()).timestamp() if start else None
+        until = datetime.combine(end + timedelta(days=1), datetime.min.time()).timestamp() if end else None
+        runs = [summarize(r) for r in state.store.load_usage(since, until)]
+        return JSONResponse({"runs": runs, **aggregate(runs), "prices": PRICES})
+
+    async def usage_clear(request: Request) -> Response:
+        n = state.store.clear("usage") if state.store else 0
+        return JSONResponse({"cleared": n})
 
     allowed_hosts = {f"127.0.0.1:{state.args.port}", f"localhost:{state.args.port}"}
 
@@ -429,6 +461,8 @@ def build_app(state: AppState) -> Starlette:
             Route("/api/stats", stats),
             Route("/api/stats/refresh", stats_refresh, methods=["POST"]),
             Route("/api/stats/compare", stats_compare),
+            Route("/api/usage", usage),
+            Route("/api/usage/clear", usage_clear, methods=["POST"]),
             Route("/api/pick", pick_last),
             Route("/api/pick/addresses", pick_addresses),
             Route("/api/pick", pick, methods=["POST"]),
