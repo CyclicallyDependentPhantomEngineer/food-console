@@ -5,8 +5,15 @@ District, Zepto and Blinkit** from one chat or one local web dashboard, powered 
 and each service's MCP server. Anything that changes your account or spends money waits
 for your explicit approval.
 
-> Unofficial personal project. Not affiliated with or endorsed by Zomato, Swiggy,
-> District, Zepto, Blinkit or Anthropic.
+> Unofficial personal project, MIT-licensed. Not affiliated with or endorsed by Zomato,
+> Swiggy, District, Zepto, Blinkit or Anthropic; their names are used only to say which
+> service an integration talks to.
+>
+> **About Blinkit:** Blinkit has no official MCP server, so the optional Blinkit integration
+> drives the blinkit.com website in a Chrome window on your own machine, for your own
+> account. It is **off by default**, contains no Blinkit code, data or assets, and may be
+> against Blinkit's terms of use, so use it at your own risk. If you represent Blinkit and
+> want it removed, please [open an issue](https://github.com/CyclicallyDependentPhantomEngineer/food-console/issues) and it will be taken down.
 
 ---
 
@@ -107,7 +114,7 @@ macOS Keychain; the web UI is bound to `127.0.0.1` behind a one-time sign-in lin
 | **Swiggy Dineout** | Table bookings | Official `https://mcp.swiggy.com/dineout` | Browser (OAuth) |
 | **District** (by Zomato) | Dining and table bookings, movies, events | Official `https://mcp-server.district.in/v2/mcp` | Browser (OAuth) |
 | **Zepto** | Groceries, Zepto Cafe | Official `https://mcp.zepto.co.in/mcp` | Browser (OAuth) |
-| **Blinkit** | Groceries | **Unofficial**: drives blinkit.com in a Chrome window ([details](#blinkit-unofficial)) | Phone number + SMS OTP |
+| **Blinkit** | Groceries | **Unofficial, off by default**: drives blinkit.com in a Chrome window ([details](#blinkit-unofficial)) | Phone number + SMS OTP |
 
 The official servers are reached through [`mcp-remote`](https://www.npmjs.com/package/mcp-remote)
 (pinned to an exact version), which handles each service's OAuth login and stores the
@@ -177,12 +184,12 @@ uv run food-auth login --app zomato      # browser login
 uv run food-auth login --app swiggy      # three browser logins, one after another
 uv run food-auth login --app district
 uv run food-auth login --app zepto
-uv run food-auth login --app blinkit     # asks for your mobile number and the SMS OTP in the terminal
+uv run food-auth login --app blinkit     # optional, unofficial: mobile number + SMS OTP in the terminal
 uv run food-auth status                  # shows every service: logged in / not logged in
 ```
 
-`--app all` (the default) signs in to everything. Each browser login waits up to
-`--timeout` seconds (default 300).
+`--app all` (the default) signs in to everything except servers that are off by default
+(Blinkit). Each browser login waits up to `--timeout` seconds (default 300).
 
 ### 4. Check everything connects
 
@@ -475,6 +482,12 @@ approach in [hereisSwapnil/blinkit-mcp](https://github.com/hereisSwapnil/blinkit
 It uses the website the way you would, so it can break when Blinkit changes its pages, and
 automating the site may be against Blinkit's terms. **Use at your own risk.**
 
+- **Off by default.** `mcp_config.json` marks it `"disabled": true`, so `food-ui`,
+  `--provider all` and `food-auth --app all` leave it out. It still runs when you ask for it
+  by name: `blinkit-chat`, `food-ui --server blinkit-mcp` (add the other servers you want
+  too), or `food-auth login --app blinkit`. Set `"disabled": false` to include it
+  everywhere.
+
 - **Chrome window:** Blinkit blocks headless browsers with a bot check, so the window is
   visible. It opens only when a Blinkit tool is first used. If a check appears, solve it in
   that window; nothing tries to hide the automation.
@@ -655,7 +668,7 @@ uv run food-cache clear all --forget-key     # also delete the database and its 
 
 ### `mcp_config.json`
 
-Server definitions, in the same `mcpServers` format as Claude Desktop, plus three extras:
+Server definitions, in the same `mcpServers` format as Claude Desktop, plus four extras:
 
 ```jsonc
 {
@@ -673,6 +686,8 @@ Server definitions, in the same `mcpServers` format as Claude Desktop, plus thre
       "blockedTools": ["create_upi_reserve_pay_order", "create_wallet_order"]
     },
     "blinkit-mcp": {
+      // Left out of food-ui, --provider all and food-auth --app all; still runs when named.
+      "disabled": true,
       // "${python}" means "the Python running this app" (for servers shipped in this package).
       "command": "${python}",
       "args": ["-m", "food_console.blinkit.server"]
@@ -727,7 +742,7 @@ each service's app.
 
 ```bash
 uv sync
-uv run pytest -q          # 96 tests; no accounts or network needed (fake MCP servers)
+uv run pytest -q          # 97 tests; no accounts or network needed (fake MCP servers)
 ```
 
 ### Project layout
@@ -776,7 +791,8 @@ mcp_config.json      MCP server definitions
 
 - Blinkit order-history parsing adapts code from
   [hereisSwapnil/blinkit-mcp](https://github.com/hereisSwapnil/blinkit-mcp)
-  (MIT, © 2025 Swapnil Singh).
+  (MIT, © 2024 Swapnil Singh); its licence is reproduced in
+  [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 - Built on the [Model Context Protocol](https://modelcontextprotocol.io),
   [mcp-remote](https://www.npmjs.com/package/mcp-remote),
   [Playwright](https://playwright.dev) and the
@@ -784,4 +800,4 @@ mcp_config.json      MCP server definitions
 - Zomato, Swiggy, District, Zepto and Blinkit are trademarks of their owners; this project
   is not affiliated with them.
 
-No licence has been chosen for this repository yet.
+Licensed under the [MIT License](LICENSE), © 2026 Soumok Dutta.
