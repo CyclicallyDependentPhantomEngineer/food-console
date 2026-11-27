@@ -19,6 +19,7 @@ from .mcp_bridge import (
     DEFAULT_CONFIG,
     PROVIDERS,
     MCPBridge,
+    default_keys,
     auth_files,
     load_server_params,
     logout,
@@ -40,7 +41,8 @@ APPS: dict[str, list[str]] = {
 
 
 def _servers(app: str, config: Path) -> list[tuple[str, StdioServerParameters]]:
-    return [(key, load_server_params(key, config)) for key in APPS[app]]
+    keys = default_keys(APPS[app], config) if app == "all" else APPS[app]  # "all" skips disabled servers
+    return [(key, load_server_params(key, config)) for key in keys]
 
 
 def _token_file(params: StdioServerParameters) -> Path | None:

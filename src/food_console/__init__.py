@@ -19,6 +19,7 @@ from .mcp_bridge import (
     PROVIDERS,
     BridgedTool,
     MCPBridge,
+    default_keys,
     load_blocked_tools,
     load_read_only_tools,
     load_server_params,
@@ -113,6 +114,8 @@ async def _pick(mcp: MCPBridge, agent: OrderAgent, args: argparse.Namespace, bra
 async def _main(args: argparse.Namespace) -> int:
     provider = PROVIDERS[args.provider]
     keys = args.server or [key for _, key in provider.servers]
+    if not args.server and len(provider.servers) > 1 and args.provider == "all":
+        keys = default_keys(keys, args.config)  # "all" leaves out servers disabled in the config
     labels = {key: label for label, key in provider.servers}
     servers = [(labels.get(key, key), load_server_params(key, args.config)) for key in keys]
     read_only_tools = {labels.get(key, key): load_read_only_tools(key, args.config) for key in keys}
