@@ -1,0 +1,39 @@
+[project]
+name = "food-console"
+version = "0.1.0"
+description = "Chat with, act on and analyse your Zomato, Swiggy, District, Zepto and Blinkit accounts through Claude and their MCP servers"
+readme = "README.md"
+authors = [
+    { name = "Soumok Dutta", email = "25546208+CyclicallyDependentPhantomEngineer@users.noreply.github.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=2.14.0",
+    "cryptography>=50.0.2",
+    "keyring>=25.7.0",
+    "mcp>=2.3.0",
+    "playwright>=1.65.2",
+    "python-dotenv>=1.2.4",
+    "starlette>=1.10.0",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+zomato-chat = "food_console:main"
+swiggy-chat = "food_console:swiggy_main"
+district-chat = "food_console:district_main"
+zepto-chat = "food_console:zepto_main"
+blinkit-chat = "food_console:blinkit_main"
+blinkit-mcp = "food_console.blinkit.server:main"
+food-ui = "food_console.web:main"
+food-auth = "food_console.auth:main"
+food-cache = "food_console.store:main"
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
