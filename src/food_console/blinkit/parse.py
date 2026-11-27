@@ -1,7 +1,8 @@
 """Pure text parsers for Blinkit pages (no browser needed, unit-tested).
 
 The order-history parsers follow the approach of hereisSwapnil/blinkit-mcp
-(src/order/services/history.py, MIT licence, Copyright (c) 2025 Swapnil Singh).
+(src/order/services/history.py, MIT licence, Copyright (c) 2024 Swapnil Singh;
+see THIRD_PARTY_NOTICES.md for the full licence text).
 """
 
 from __future__ import annotations
