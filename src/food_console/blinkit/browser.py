@@ -11,10 +11,8 @@ the site changes, so every step reports what it actually saw instead of assuming
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,7 +22,6 @@ from .parse import inr, parse_card_text, parse_history_detail, parse_history_sum
 
 HOME = "https://blinkit.com/"
 ORDERS = "https://blinkit.com/account/orders"
-QR_PATH = session.SESSION_PATH.with_name("blinkit_payment_qr.png")
 
 CARD = "div[role='button'][id]"
 LOCATION_BAR = "div[class*='LocationBar__Container']"
@@ -364,7 +361,7 @@ class Blinkit:
             const bill = [...d.querySelectorAll("div[class*='BillCard__BillItemContainer']")].map(b => {
               const p = b.innerText.split('\\n').map(s => s.trim()).filter(Boolean);
               // e.g. "Items total ₹150 ₹118" (MRP then price): keep the last amount.
-              return p.length >= 2 ? { label: p[0], value: p[p.length - 1].split(/\s+(?=₹)/).pop() } : null; }).filter(Boolean);
+              return p.length >= 2 ? { label: p[0], value: p[p.length - 1].split(/\\s+(?=₹)/).pop() } : null; }).filter(Boolean);
             return { items, bill,
               address: [t(d, "div[class*='ListStrip__Heading']"), t(d, "div[class*='ListStrip__SubHeading']")].filter(Boolean).join(' - '),
               total: t(d, "div[class*='CheckoutStrip__NetPriceText']"),
@@ -451,14 +448,10 @@ class Blinkit:
         src = await img.get_attribute("src") or ""
         if not src.startswith("data:image/"):
             return {"ok": True, "message": "QR shown in the Chrome window: the user scans it with a UPI app to pay."}
-        fd = os.open(QR_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as f:
-            f.write(base64.b64decode(src.split(",", 1)[1]))
-        if sys.platform == "darwin":
-            subprocess.run(["open", str(QR_PATH)], check=False)
-        return {"ok": True, "message": "UPI QR generated and opened on screen (also visible in the Chrome window). "
+        # The app shows this image as a payment card (and strips it from what the model sees).
+        return {"ok": True, "message": "UPI QR generated and shown to the user (also visible in the Chrome window). "
                 "The order is placed once the user pays it in their UPI app; check order_history after.",
-                "qr_file": str(QR_PATH)}
+                "qr_image": src}
 
     # ------------------------------------------------------------------ history
     async def order_history(self, count: int = 10) -> dict[str, Any]:

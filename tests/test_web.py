@@ -107,7 +107,7 @@ def test_read_only_tool_runs(client):
 def test_changing_tool_needs_confirm(client):
     assert client.post("/api/tools/zomato_place_order", json={"args": {"cart_id": "c1"}}).status_code == 409
     r = client.post("/api/tools/zomato_place_order", json={"args": {"cart_id": "c1"}, "confirm": True})
-    assert r.json() == {"result": "placed c1", "is_error": False, "source": "live", "cached_at": None}
+    assert r.json() == {"result": "placed c1", "is_error": False, "source": "live", "cached_at": None, "payments": []}
 
 
 def test_approve_unknown_id(client):

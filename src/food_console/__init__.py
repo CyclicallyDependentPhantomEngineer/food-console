@@ -18,6 +18,7 @@ from .mcp_bridge import (
     PROVIDERS,
     BridgedTool,
     MCPBridge,
+    load_blocked_tools,
     load_read_only_tools,
     load_server_params,
     logout,
@@ -113,6 +114,7 @@ async def _main(args: argparse.Namespace) -> int:
     labels = {key: label for label, key in provider.servers}
     servers = [(labels.get(key, key), load_server_params(key, args.config)) for key in keys]
     read_only_tools = {labels.get(key, key): load_read_only_tools(key, args.config) for key in keys}
+    blocked_tools = {labels.get(key, key): load_blocked_tools(key, args.config) for key in keys}
 
     if args.command == "logout":
         return _logout(servers)
@@ -120,7 +122,9 @@ async def _main(args: argparse.Namespace) -> int:
     print(f"Connecting to {provider.brand}: {', '.join(label for label, _ in servers)} ...")
     print("First run opens a browser login per server; mcp-remote caches tokens in ~/.mcp-auth.")
 
-    async with MCPBridge(servers, store=Store(), read_only_tools=read_only_tools) as mcp:
+    store = Store()
+    async with MCPBridge(servers, store=store, read_only_tools=read_only_tools,
+                         blocked_tools=blocked_tools) as mcp:
         agent = OrderAgent(
             mcp,
             _approve,

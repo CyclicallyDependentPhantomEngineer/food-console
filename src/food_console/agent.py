@@ -49,6 +49,38 @@ def print_event(event: dict[str, Any]) -> None:
     elif event["type"] == "tool_call":
         args = f"({json.dumps(event['args'], ensure_ascii=False)})" if event.get("verbose") else ""
         print(f"  -> {event['tool']}{args}")
+    elif event["type"] == "payment":
+        print_payments(event["items"])
+
+
+def print_payments(items: list[dict[str, Any]]) -> None:
+    """Show payment items in the terminal: UPI QR as text art, links as URLs, images in a viewer."""
+    import base64
+    import subprocess
+    import sys
+
+    import segno
+
+    from .store import DB_PATH
+
+    for item in items:
+        print("\n" + "=" * 60)
+        if item["kind"] == "upi":
+            amount = f"₹{item['amount_inr']:g}" if item.get("amount_inr") is not None else "amount not stated"
+            print(f"PAY WITH ANY UPI APP: {item.get('payee_name') or ''} <{item['payee_vpa']}>  {amount}")
+            segno.make(item["uri"], error="m").terminal(compact=True)
+        elif item["kind"] == "link":
+            print(f"PAYMENT LINK ({item['host']}): {item['url']}")
+        else:
+            path = DB_PATH.with_name("payment_qr." + item["src"].split(";")[0].split("/")[-1].replace("svg+xml", "svg"))
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(base64.b64decode(item["src"].split(",", 1)[1]))
+            print(f"PAYMENT QR saved to {path}")
+            if sys.platform == "darwin":
+                subprocess.run(["open", str(path)], check=False)
+        print("Check the payee and amount in your UPI app before entering your PIN.")
+        print("=" * 60)
 
 
 class OrderAgent:
@@ -132,6 +164,8 @@ class OrderAgent:
         try:
             r = await self.mcp.call_ex(block.name, args)
             text, is_error, source = r.text, r.is_error, r.source
+            if r.payments:
+                self.on_event({"type": "payment", "tool": tool.label, "items": r.payments})
         except Exception as exc:  # surface MCP/transport failures to the model, don't crash the chat
             text, is_error = f"Tool call failed: {exc}", True
         self.on_event({"type": "tool_result", "tool": tool.label, "is_error": is_error, "chars": len(text), "source": source})

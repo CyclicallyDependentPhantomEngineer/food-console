@@ -39,6 +39,7 @@ from .mcp_bridge import (
     PROVIDERS,
     BridgedTool,
     MCPBridge,
+    load_blocked_tools,
     load_read_only_tools,
     load_server_params,
     normalize_schema,
@@ -214,12 +215,14 @@ def build_app(state: AppState) -> Starlette:
             return JSONResponse({"error": "args must be an object"}, status_code=400)
         if state.chat.needs_approval(tool) and body.get("confirm") is not True:
             return JSONResponse({"error": "confirmation required"}, status_code=409)
+        payments: list[dict[str, Any]] = []
         try:
             r = await state.mcp.call_ex(name, args)
-            text, is_error, source, cached_at = r.text, r.is_error, r.source, r.cached_at
+            text, is_error, source, cached_at, payments = r.text, r.is_error, r.source, r.cached_at, r.payments
         except Exception as exc:
             text, is_error, source, cached_at = f"Tool call failed: {exc}", True, "live", None
-        return JSONResponse({"result": text, "is_error": is_error, "source": source, "cached_at": cached_at})
+        return JSONResponse({"result": text, "is_error": is_error, "source": source, "cached_at": cached_at,
+                             "payments": payments})
 
     async def chat(request: Request) -> Response:
         assert state.chat
@@ -427,13 +430,15 @@ async def _serve(args: argparse.Namespace) -> None:
     labels = {key: label for label, key in PROVIDERS["all"].servers}
     servers = [(labels.get(key, key), load_server_params(key, args.config)) for key in keys]
     read_only_tools = {labels.get(key, key): load_read_only_tools(key, args.config) for key in keys}
+    blocked_tools = {labels.get(key, key): load_blocked_tools(key, args.config) for key in keys}
 
     print("Connecting to MCP servers (first run opens a browser login per server) ...")
     print(f"mcp-remote logs: {LOG_DIR}")
     store = Store()
     print(f"Local cache: {store.path}")
     async with MCPBridge(servers, connect_timeout=args.connect_timeout, log_dir=LOG_DIR, require_any=False,
-                         store=store, cache_ttl=args.cache_ttl, read_only_tools=read_only_tools) as mcp:
+                         store=store, cache_ttl=args.cache_ttl, read_only_tools=read_only_tools,
+                         blocked_tools=blocked_tools) as mcp:
         state.mcp = mcp
         state.store = store
         state.chat = state.new_agent()

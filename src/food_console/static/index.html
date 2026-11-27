@@ -405,6 +405,23 @@ table.cmp tr:hover td { background: none; }
 .fv { display: inline-flex; align-items: center; gap: 7px; font-weight: 700; }
 #cmpby[hidden] { display: none !important; }
 
+/* ---------- payment card ---------- */
+.paycard { border: 1.5px solid color-mix(in srgb, var(--ok) 45%, var(--line)); border-radius: 16px; background: var(--panel);
+  overflow: hidden; max-width: 640px; margin-left: 44px; box-shadow: var(--shadow); }
+.paycard .head { display: flex; gap: 8px; align-items: center; padding: 10px 14px; font-weight: 800; font-size: 13.5px;
+  background: color-mix(in srgb, var(--ok) 12%, var(--panel)); color: var(--ok); }
+.paycard .item { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 16px; padding: 14px; align-items: start; }
+.paycard .item + .item { border-top: 1px solid var(--line); }
+.paycard .qr { width: 200px; height: 200px; border-radius: 12px; background: #fff; padding: 6px; object-fit: contain; }
+.paycard .amt { font-size: 26px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.paycard dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; margin: 8px 0; font-size: 13px; }
+.paycard dt { color: var(--muted); font-weight: 600; } .paycard dd { margin: 0; overflow-wrap: anywhere; }
+.paycard .warn { font-size: 12px; color: var(--ink2); background: color-mix(in srgb, var(--warn) 12%, transparent); border-radius: 10px; padding: 7px 10px; display: flex; gap: 6px; }
+.paycard .warn svg.i { width: 14px; height: 14px; color: var(--warn); flex: none; margin-top: 1px; }
+.paycard .acts { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.paycard .acts .btn { padding: 8px 14px; font-size: 13px; text-decoration: none; }
+@media (max-width: 600px) { .paycard { margin-left: 0; } .paycard .item { grid-template-columns: 1fr; } }
+
 /* ---------- pick (calories & protein) ---------- */
 #pickbody { margin-top: 16px; }
 .goals { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
@@ -853,6 +870,37 @@ function actChip(ev, cls) {
     el("span", { class: "spin" }), icon(toolIcon(rest.join(":"))), rest.join(":").replace(/_/g, " "));
   activity.append(chip); return chip;
 }
+// Payment items come only from account-changing tool results (server side), never from read-only ones.
+function paymentCard(items, { tool, onPaid } = {}) {
+  const [server] = (tool || "").split(":"); const s = svc(server);
+  const card = el("div", { class: "paycard fade" },
+    el("div", { class: "head" }, icon("card"), "Complete the payment", tool ? el("span", { class: "tag svc", style: { "--c": s.color, "margin-left": "auto" } }, s.name) : null));
+  for (const it of items) {
+    const details = el("dl");
+    const add = (k, v) => { if (v) details.append(el("dt", {}, k), el("dd", {}, v)); };
+    let qr = null, main = null, extra = [];
+    if (it.kind === "upi") {
+      qr = el("img", { class: "qr", src: it.qr, alt: "UPI QR code" });
+      // Exact amount, paise included: this is what the QR will charge.
+      main = el("div", { class: "amt" }, it.amount_inr != null ? "₹" + it.amount_inr.toLocaleString("en-IN", { minimumFractionDigits: it.amount_inr % 1 ? 2 : 0, maximumFractionDigits: 2 }) : "Amount not stated");
+      add("Pay to", it.payee_name || "—"); add("UPI ID", it.payee_vpa); add("Note", it.note);
+      extra.push(el("button", { class: "btn ghost", onclick: e => { navigator.clipboard?.writeText(it.payee_vpa); e.currentTarget.textContent = "UPI ID copied"; } }, icon("copy", "width:15px;height:15px"), "Copy UPI ID"));
+    } else if (it.kind === "link") {
+      qr = el("img", { class: "qr", src: it.qr, alt: "QR code for the payment link" });
+      main = el("div", { style: { "font-weight": "800" } }, "Payment link");
+      add("Site", it.host); add("Link", it.url);
+      extra.push(el("a", { class: "btn ghost", href: it.url, target: "_blank", rel: "noopener noreferrer" }, icon("card", "width:15px;height:15px"), "Open payment page"));
+    } else {
+      qr = el("img", { class: "qr", src: it.src, alt: "Payment QR code from the service" });
+      main = el("div", { style: { "font-weight": "800" } }, "Scan to pay");
+      add("Source", "QR image sent by " + s.name);
+    }
+    card.append(el("div", { class: "item" }, qr, el("div", {}, main, details,
+      el("div", { class: "warn" }, icon("shield"), el("span", {}, "Scan with any UPI app. Before entering your PIN, check that the payee and amount match your order. Payment only happens in your UPI app.")),
+      el("div", { class: "acts" }, onPaid ? el("button", { class: "btn ok", onclick: onPaid }, icon("check", "width:15px;height:15px"), "I've paid — check status") : null, ...extra))));
+  }
+  return card;
+}
 const typing = el("div", { class: "typing" }, el("i"), el("i"), el("i"));
 async function send() {
   const message = input.value.trim(); if (!message || sendBtn.disabled) return;
@@ -875,6 +923,10 @@ async function send() {
       else if (ev.type === "tool_declined") actChip(ev, "done err");
       else if (ev.type === "text") { log.insertBefore(bubble("bot", ev.text), typing); activity = null; }
       else if (ev.type === "approval") { log.insertBefore(approvalCard(ev), typing); activity = null; }
+      else if (ev.type === "payment") {
+        log.insertBefore(paymentCard(ev.items, { tool: ev.tool, onPaid: () => { input.value = "I've paid. Check the payment status and confirm the order."; send(); } }), typing);
+        activity = null;
+      }
       else if (ev.type === "done") log.insertBefore(bubble("bot", ev.text || "(no reply)"), typing);
       else if (ev.type === "error") log.insertBefore(bubble("bot", "**Something went wrong:** " + ev.message), typing);
       scroll();
@@ -968,7 +1020,7 @@ function renderDetail(t) {
   };
   const result = el("div"), confirmBox = el("div");
   const runBtn = el("button", { class: "btn primary" }, icon(t.read_only ? "bolt" : "shield"), t.read_only ? "Run" : "Review and run");
-  const showResult = (text, isError, ms, source, cachedAt) => {
+  const showResult = (text, isError, ms, source, cachedAt, payments) => {
     const pre = el("pre"); pre.innerHTML = jsonHTML(text);
     const copy = el("button", { class: "link", onclick: () => { navigator.clipboard?.writeText(text); copy.textContent = "Copied"; } }, "Copy");
     result.replaceChildren(el("div", { class: "result fade" },
@@ -977,6 +1029,7 @@ function renderDetail(t) {
         source && source !== "live" ? el("span", { class: "tag", style: { color: "var(--dineout)" }, title: source === "cache" ? "Same request moments ago" : "Server unavailable" },
           `from cache · ${cachedAt ? new Date(cachedAt).toLocaleString() : ""}`) : null,
         el("span", { class: "grow" }), copy), pre));
+    if (payments && payments.length) { const pc = paymentCard(payments, { tool: t.label }); pc.style.marginLeft = "0"; pc.style.marginBottom = "12px"; result.prepend(pc); }
   };
   const run = async confirm => {
     let args; try { args = collect(); } catch (e) { result.replaceChildren(el("div", { class: "note", style: { color: "var(--err)" } }, icon("alert"), e.message)); return; }
@@ -994,7 +1047,7 @@ function renderDetail(t) {
     try {
       const r = await api("/api/tools/" + encodeURIComponent(t.name), { args, confirm: confirm === true });
       const d = await r.json(); if (!r.ok) throw new Error(d.error);
-      showResult(d.result, d.is_error, Math.round(performance.now() - t0), d.source, d.cached_at);
+      showResult(d.result, d.is_error, Math.round(performance.now() - t0), d.source, d.cached_at, d.payments);
     } catch (e) { result.replaceChildren(el("div", { class: "note", style: { color: "var(--err)" } }, icon("alert"), e.message)); }
     runBtn.disabled = false;
   };
