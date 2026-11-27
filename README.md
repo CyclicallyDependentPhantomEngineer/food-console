@@ -32,13 +32,18 @@ uv run food-ui                           # start the web dashboard
 
 | | |
 |---|---|
-| **Chat** | One conversation across every connected service |
+| **Chat** | One conversation across every connected service; UPI payments shown as a QR you scan |
 | **Actions** | Every tool every service offers, as a form you can run by hand |
-| **Pick** | Dishes near you ranked by calories and protein, using Zomato's published nutrition where available |
+| **Pick** | Dishes near a saved address ranked by calories and protein (or a no-limits **treat**), with distances |
+| **Usage** | Tokens and estimated cost of every chat message, Pick search and Stats refresh |
 | **Stats** | Combined order history: spend over time, platforms compared, health score, every order with timestamps |
 
+Each request goes to the cheapest Claude model that suits it (Haiku 5.5 for lookups,
+Sonnet 5.5 for search and ordering, Opus 5.5 for analysis); you can override it.
+
 **Safety in one breath:** runs only on your machine; anything not known to be read-only
-asks before running; personal data in the local cache is encrypted with a key in your
+asks before running; payments happen only in your UPI app with your PIN (the app shows
+the QR, it never pays); personal data in the local cache is encrypted with a key in your
 macOS Keychain; the web UI is bound to `127.0.0.1` behind a one-time sign-in link.
 
 ---
@@ -54,7 +59,10 @@ macOS Keychain; the web UI is bound to `127.0.0.1` behind a one-time sign-in lin
 - [Using the terminal apps](#using-the-terminal-apps)
 - [Pick: what to order by calories and protein](#pick-what-to-order-by-calories-and-protein)
 - [Stats: your combined order history](#stats-your-combined-order-history)
+- [Usage: tokens per run](#usage-tokens-per-run)
+- [Model routing](#model-routing)
 - [Service notes](#service-notes)
+- [Payments](#payments)
 - [Safety and privacy](#safety-and-privacy)
 - [Local cache](#local-cache)
 - [Configuration](#configuration)
@@ -73,9 +81,15 @@ macOS Keychain; the web UI is bound to `127.0.0.1` behind a one-time sign-in lin
   District.
 - **Approval before anything changes.** Carts, addresses, bookings, orders and payments
   show an approval card (web) or a `y/N` prompt (terminal) with the exact arguments.
-- **Dish picker.** Ranks dishes near you against a calorie cap, a protein minimum, a
-  price limit and veg/non-veg. Uses the platform's own nutrition numbers when it publishes
-  them, checks them for obvious errors, and clearly marks estimates.
+- **Dish picker.** Ranks dishes near a saved address against a calorie cap, a protein
+  minimum, a price limit and veg/non-veg, or as a no-limits **treat**. A craving is the
+  only thing searched. Uses the platform's own nutrition numbers and distances when it
+  publishes them, checks nutrition for obvious errors, and clearly marks estimates.
+- **Safe payments.** UPI payment requests are shown as a QR with the payee and exact
+  amount; you pay in your UPI app with your PIN. Ways to pay without a PIN are off by
+  default.
+- **Model routing and usage tracking.** Each request goes to Haiku, Sonnet or Opus 5.5
+  depending on the task, and the Usage tab shows tokens and estimated cost per run.
 - **Combined stats.** Spend, orders, savings, fees, delivery times, a weekday × hour
   heatmap, top places and items, a rough eating-habits score, and a full order table with
   CSV export. Filter by date range and platform, or compare platforms side by side.
@@ -111,7 +125,8 @@ flowchart LR
 ```
 
 1. The app starts each service's MCP server as a local subprocess and collects its tools.
-2. Your message and the tool list go to Claude. Claude decides which tools to call.
+2. A router picks the Claude model for the task (see [Model routing](#model-routing)).
+   Your message and the tool list go to that model, which decides which tools to call.
 3. The app runs each tool call locally. Read-only calls run straight away; anything else
    waits for your approval. Results go back to Claude until it has an answer.
 4. Calculations that must be exact (stats, rankings, nutrition checks) are done in plain
@@ -203,7 +218,10 @@ the background (every 2 minutes, backing off to 15); click one to retry immediat
 Ask in plain language across all services. Tool activity appears as chips (marked
 "cached" when the answer came from the local cache). When Claude wants to do something
 that is not read-only, an **approval card** shows the tool and its exact arguments;
-nothing runs until you click **Approve and run**.
+nothing runs until you click **Approve and run**. Each reply starts with a small chip
+naming the model that answered and why; the **Model** menu under the chat box overrides
+the automatic choice. When an order needs a UPI payment, a [payment card](#payments)
+shows the QR, payee and amount, and **I've paid — check status** confirms the order.
 
 Example prompts:
 
@@ -222,6 +240,10 @@ confirmation step first. Results show whether they came live or from the cache.
 ### Pick
 
 See [Pick](#pick-what-to-order-by-calories-and-protein).
+
+### Usage
+
+See [Usage](#usage-tokens-per-run).
 
 ### Stats
 
@@ -255,10 +277,19 @@ When a tool needs approval, the arguments are printed and you answer `y` or `N`.
 
 ## Pick: what to order by calories and protein
 
-Find dishes near your saved address that fit a calorie and protein goal.
+Find dishes near a saved address that fit a calorie and protein goal, or a treat with no
+limits at all.
 
 **Web:** the **Pick** tab. Choose a goal preset or your own limits, optionally a craving
-("chicken", "paneer", "south indian"), veg / non-veg and platform, then **Find dishes**.
+("chicken", "paneer", "south indian"), the delivery address, veg / non-veg and platform,
+then **Find dishes**. **Deliver to** lists your saved Zomato and Swiggy addresses (read
+directly from each platform, no Claude call); the other platform's saved address at the
+same place is matched automatically, and a platform with no matching address is skipped
+and noted. Only addresses that are really in your saved list are accepted.
+Each dish shows its restaurant's **distance from that address** (e.g. "1.3 km from
+Office"), read directly from the platform's search results (Zomato `distance`, Swiggy
+`distanceKm`) rather than from the model; the address card shows the nearest and median
+distance. Dishes whose platform didn't state a distance show none.
 You get a calories-vs-protein chart with your target zone shaded, the best picks, and a
 card per dish with its goal checks, where its numbers came from, and **Order in chat**.
 
@@ -277,9 +308,10 @@ uv run swiggy-chat pick "south indian" --goal light
 | `protein` | ≥ 40 g protein | most protein |
 | `light` | ≤ 450 kcal, ≥ 15 g protein | fewest calories |
 | `value` | ≤ ₹300, ≤ 800 kcal, ≥ 25 g protein | protein per ₹100 |
+| `treat` | **No calorie or protein limits** (any given are ignored); price and diet still apply | best rated |
 
 `--max-kcal`, `--min-protein`, `--max-price`, `--diet any|veg|non_veg`,
-`--sort density|protein|kcal|per_rupee`, `--address <saved label>` and `--top N` override
+`--sort density|protein|kcal|per_rupee|rating|indulgent`, `--address <saved label>` and `--top N` override
 or refine a preset.
 
 **Where the numbers come from:**
@@ -287,6 +319,11 @@ or refine a preset.
 - Claude gets **only read-only search, menu and address tools** for Pick (no carts,
   orders or history) and proposes candidate dishes, each with its own per-serving
   estimate of calories, protein, carbs and fat.
+- **The craving is the only search.** If you enter one, every search uses exactly that
+  keyword (case and punctuation aside): a search with any other or extra keyword, or with
+  none, is refused before it runs, and dishes Claude marks as not matching the craving are
+  left out (the result says how many). Menus are read only for restaurants that search
+  returned. With no craving, Claude picks searches that suit the goal.
 - **Zomato publishes nutrition for many dishes.** Those numbers are read directly from
   Zomato's raw responses by item ID in Python (not copied by the model) and shown as
   "Zomato-listed". A value the model says came from a tool is accepted only if it really
@@ -297,6 +334,10 @@ or refine a preset.
   says why. Listed values that pass but differ a lot from the estimate are used with a
   note.
 - Dishes that meet every limit come first, then the chosen ranking applies.
+- **Treat yourself** (`treat`) is for an indulgent meal: calories and protein are not
+  limited or ranked on (they are still shown for information), Claude searches comfort food
+  such as pizza, burgers, biryani, fried chicken and desserts unless you give a craving, and
+  results are ranked by restaurant rating, or by **most indulgent** (most calories).
 - Estimates are for one serving as sold and can be off by 20–30%. **Not medical advice.**
 - **Order in chat** pre-fills a chat message; the cart and checkout still need your
   approval.
@@ -336,6 +377,65 @@ How services map into Stats: District dining is service `dineout` and tickets ar
 
 A refresh can use many output tokens when there are large grocery orders (capped at 128K
 per refresh); most refreshes use far less.
+
+## Usage: tokens per run
+
+The **Usage** tab records every run - one chat message, one Pick search, one Stats refresh,
+or one terminal command - with its token use and an estimated cost:
+
+- **Totals** for today, 7 days, 30 days or all time: tokens, estimated cost, how much input
+  came from the prompt cache, output tokens.
+- **Tokens per day** (cache reads, new input, cache writes, output) and **by activity**
+  (Chat, Pick, Stats, Terminal).
+- **Every run**, with its request text, number of API calls and tool calls, tokens, cache
+  share, cost and duration. Click a run to see each API call (prompt size, cache read and
+  write, output, cost, which tool it called next) and the biggest tool results.
+
+Why a single order can use a lot: every API call in a run re-sends the same starting prompt
+(instructions, every tool definition of every connected service, and the conversation so
+far), plus each tool result from earlier calls. Placing an order takes many calls (search,
+menu, cart, payment options, place order, payment status, confirm), so that base is sent
+10+ times. The prompt cache makes repeats cost 5% of new input, which is why the cache
+share is usually high, but it still adds up; the run detail shows the starting prompt size
+so you can see it.
+
+Costs are estimates at Claude API list prices for the model each call used (see
+[Model routing](#model-routing)); routing calls are included, and billing through your
+`ant` sign-in may differ. The history is stored encrypted in `.cache/food.db` (it includes your
+messages); **Clear history** in the tab or `food-cache clear usage` deletes it.
+
+## Model routing
+
+Each run is sent to the cheapest model that suits it:
+
+| Tier | Model | Used for | Price per million tokens (input / output) |
+|---|---|---|---|
+| light | Claude Haiku 5.5 | Lookups and status: saved addresses, cart, order tracking, recent orders, payment status | $0.10 / $0.50 (prompts up to 100K tokens) |
+| standard | Claude Sonnet 5.5 | Search and compare, menus, carts, coupons, orders, bookings, payments; **Pick** and **Stats refresh** | $2 / $10 |
+| complex | Claude Opus 5.5 | Analysis and planning: spending or health across history, multi-service plans, open-ended requests | $4 / $20 |
+
+- **How chat messages are routed:** a small Claude Haiku 5.5 call (no tools, a few hundred
+  tokens, a tiny fraction of a cent) reads the message and the last few turns and picks a
+  tier; when unsure it picks the higher one. Pick and Stats refresh always use the standard
+  tier, with no routing call.
+- **Only up within a conversation.** Once a conversation has used a larger model it stays
+  there: moving to a smaller model mid-conversation would drop the earlier turns' reasoning
+  and restart the prompt cache, while moving up keeps both. **New conversation** starts
+  from the bottom again.
+- **Only the model changes, never the tools.** Changing the tool list mid-conversation
+  invalidates earlier reasoning, so every tier gets the same tools.
+- **You can override it:** the **Model** menu under the chat box (Auto, Haiku 5.5, Sonnet
+  5.5, Opus 5.5; your choice wins, even mid-conversation), or `--model auto|haiku|sonnet|opus`
+  in the terminal apps.
+- **You can see it:** each reply in Chat starts with a chip naming the model and why
+  ("Sonnet 5.5 · auto · reorder: build cart and place order"); the **Usage** tab shows the
+  model per run and a **By model** split, with routing calls included in the cost.
+- If the routing call fails, the standard tier is used. Refusal fallbacks
+  (`fallbacks: "default"`) are sent only with Opus requests.
+
+Settings: `FOOD_ROUTER=off` sends everything to `FOOD_MODEL` (or `ZOMATO_CHAT_MODEL`,
+default Claude Opus 5.5); `FOOD_MODEL_LIGHT`, `FOOD_MODEL_STANDARD`, `FOOD_MODEL_COMPLEX`
+change a tier's model; `FOOD_ROUTER_MODEL` changes the routing model.
 
 ## Service notes
 
@@ -389,8 +489,8 @@ automating the site may be against Blinkit's terms. **Use at your own risk.**
 - **Money guard:** `checkout(expected_total_inr)` and
   `place_order(payment, expected_total_inr)` refuse to continue unless the cart total
   equals the total you approved. Any later cart or address change voids that total. The
-  payment method (`cod` or `upi_qr`) must be chosen explicitly. A UPI QR is saved
-  owner-only to `.cache/blinkit_payment_qr.png` and opened on screen.
+  payment method (`cod` or `upi_qr`) must be chosen explicitly. A UPI QR is shown as a
+  payment card (see [Payments](#payments)).
 - **Tested live while logged out:** location search, product search (price, MRP,
   discount, ETA, sponsored flag), add/remove, cart and bill parsing, and the total guard.
   Login, saved addresses, the payment page and order history need a logged-in account and
@@ -413,6 +513,45 @@ automating the site may be against Blinkit's terms. **Use at your own risk.**
 
 </details>
 
+## Payments
+
+The official servers (Swiggy, District, Zepto) expect a chat app that displays their
+payment widget. This app shows the same thing as a **payment card** in Chat (and under the
+result in Actions):
+
+- **UPI QR:** for a UPI payment request (`upi://pay…`, or app-specific links such as
+  `tez://upi/pay…`), the card shows the exact amount, the payee name and UPI ID, and a QR
+  code drawn locally from the platform's own request, unchanged. Scan it with any UPI app.
+- **QR images** sent by the service are shown as they are.
+- **Payment links** on payment gateways (Razorpay, Paytm, PhonePe, Juspay, Cashfree, PayU,
+  BillDesk), or on the services' own payment pages, get a QR and an **Open payment page**
+  button. Links on any other site are never turned into a card.
+- **I've paid — check status** asks Claude to check the payment status and confirm the
+  order. Claude is told never to call an order placed before that.
+
+How this keeps paying safe:
+
+- **You pay, not the app.** Money only moves when you approve it in your UPI app with your
+  PIN. Nothing in this app can complete a payment, and it stores no card, UPI or wallet
+  details.
+- **Check before your PIN.** The card shows the payee and the exact amount (paise
+  included); your UPI app shows them again before you enter the PIN.
+- **Only from account-changing tools.** Payment cards are built only from results of tools
+  that needed your approval (placing an order, paying). A UPI link inside a menu, review or
+  search result is never shown as a card.
+- **No PIN-less payment by default.** Ways to pay without your PIN are turned off with
+  `blockedTools` in `mcp_config.json`: Zepto's wallet (`create_wallet_order`) and UPI
+  Reserve Pay (`create_upi_reserve_pay_order`, a pre-authorised mandate). Remove an entry
+  to allow it; it still asks for approval.
+- **Cash on delivery** remains available where the service offers it.
+
+About "payment MCP servers": the ones that exist (Razorpay, Paytm, Juspay) are for
+merchants collecting money, not for paying as a customer. Giving an agent a way to pay
+without your PIN (stored wallet, card or mandate) is exactly what this app avoids.
+
+In the terminal apps, a UPI QR is printed in the terminal, a payment link is printed as a
+URL, and a QR image is saved owner-only to `.cache/` and opened.
+
 ## Safety and privacy
 
 ### Approval gate
@@ -429,8 +568,8 @@ blocks non-read-only tools outright.
 - The app, the MCP servers and the web UI run locally.
 - Service logins: `mcp-remote` tokens in `~/.mcp-auth`; the Blinkit session encrypted in
   `.cache/`.
-- Cache, saved orders and last pick: encrypted in `.cache/food.db` (see
-  [Local cache](#local-cache)).
+- Cache, saved orders, last pick and token-usage history: encrypted in `.cache/food.db`
+  (see [Local cache](#local-cache)).
 - Logs: `.cache/logs/<server>.log` (request names, not personal data).
 
 ### What leaves your machine
@@ -468,7 +607,8 @@ blocks non-read-only tools outright.
 
 `.cache/food.db` (SQLite, git-ignored, owner-only) is shared by `food-ui` and the terminal
 apps. Personal data in it is **encrypted** (Fernet: AES + HMAC): cached tool arguments and
-results, saved orders and their metadata, and the last dish pick. Order IDs are stored
+results, saved orders and their metadata, the last dish pick, and the token-usage history
+(which includes your messages). Order IDs are stored
 only as keyed hashes. The key lives in the **macOS Keychain** (item "food-console"; any
 `keyring` backend on other systems), or in an owner-only `food.db.key` file when no
 keychain is available. If the key is lost the cache is simply treated as empty. Tool lists
@@ -491,6 +631,7 @@ uv run food-cache clear                      # cached tool results (default)
 uv run food-cache clear results --server food
 uv run food-cache clear orders               # saved order history used by Stats
 uv run food-cache clear picks                # last dish pick
+uv run food-cache clear usage                # token usage history
 uv run food-cache clear all
 uv run food-cache clear all --forget-key     # also delete the database and its Keychain key
 ```
@@ -502,8 +643,11 @@ uv run food-cache clear all --forget-key     # also delete the database and its 
 | Variable | Default | Purpose |
 |---|---|---|
 | `ANTHROPIC_PROFILE` | active `ant` profile | `ant` profile used for Claude |
-| `ZOMATO_CHAT_MODEL` | `claude-opus-5-5` | Claude model (all apps) |
-| `ZOMATO_CHAT_EFFORT` | `medium` | Reasoning effort: `low` / `medium` / `high` / `xhigh` / `max` |
+| `FOOD_ROUTER` | `auto` | `off` disables [model routing](#model-routing) |
+| `FOOD_MODEL_LIGHT` / `_STANDARD` / `_COMPLEX` | Haiku / Sonnet / Opus 5.5 | Model for each routing tier |
+| `FOOD_ROUTER_MODEL` | `claude-haiku-5-5` | Model that classifies chat messages |
+| `FOOD_MODEL`, `ZOMATO_CHAT_MODEL` | `claude-opus-5-5` | The single model used when routing is off |
+| `ZOMATO_CHAT_EFFORT` | `medium` | Reasoning effort when routing is off (`low` … `max`) |
 | `FOOD_UI_PORT` | `8765` | Web UI port |
 | `MCP_REMOTE_CONFIG_DIR` | `~/.mcp-auth` | Where `mcp-remote` keeps OAuth tokens |
 | `FOOD_CONSOLE_KEY_BACKEND` | Keychain | Set to `file` to keep the cache key in a file instead |
@@ -511,7 +655,7 @@ uv run food-cache clear all --forget-key     # also delete the database and its 
 
 ### `mcp_config.json`
 
-Server definitions, in the same `mcpServers` format as Claude Desktop, plus two extras:
+Server definitions, in the same `mcpServers` format as Claude Desktop, plus three extras:
 
 ```jsonc
 {
@@ -521,6 +665,12 @@ Server definitions, in the same `mcpServers` format as Claude Desktop, plus two 
       "args": ["-y", "mcp-remote@0.17.1", "https://mcp-server.zomato.com/mcp"],
       // Only for servers that don't label their tools: the tools allowed to run without asking.
       "readOnlyTools": ["get_order_history", "get_saved_addresses_for_user", "..."]
+    },
+    "zepto-mcp": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote@0.17.1", "https://mcp.zepto.co.in/mcp"],
+      // Tools never offered to Claude or the Actions tab (here: ways to pay without your UPI PIN).
+      "blockedTools": ["create_upi_reserve_pay_order", "create_wallet_order"]
     },
     "blinkit-mcp": {
       // "${python}" means "the Python running this app" (for servers shipped in this package).
@@ -534,17 +684,18 @@ Server definitions, in the same `mcpServers` format as Claude Desktop, plus two 
 `--server <key>` (repeatable) picks servers from this file; `--config <path>` uses another
 file.
 
-Requests to Claude enable server-side refusal fallback (`fallbacks: "default"`): if the
-model declines a request for safety reasons, the API retries it on a fallback model.
+Requests to Claude Opus enable server-side refusal fallback (`fallbacks: "default"`): if
+the model declines a request for safety reasons, the API retries it on a fallback model.
+Haiku and Sonnet requests don't send it.
 
 ## Command reference
 
 | Command | What it does | Useful options |
 |---|---|---|
 | `food-ui` | Web dashboard | `--server`, `--port`, `--no-browser`, `--connect-timeout` (180 s), `--history-limit` (50), `--cache-ttl` (60 s), `--profile`, `--config` |
-| `zomato-chat`, `swiggy-chat`, `district-chat`, `zepto-chat`, `blinkit-chat` | Terminal chat | `--provider`, `--server`, `--no-orders`, `-v`, `--profile`, `--config`; subcommands `chat`, `ask`, `pick`, `tools`, `logout` |
+| `zomato-chat`, `swiggy-chat`, `district-chat`, `zepto-chat`, `blinkit-chat` | Terminal chat | `--provider`, `--server`, `--model`, `--no-orders`, `-v`, `--profile`, `--config`; subcommands `chat`, `ask`, `pick`, `tools`, `logout` |
 | `food-auth` | Sign in / out / status | `login\|logout\|status`, `--app`, `--force`, `--timeout`, `--kill-stale` |
-| `food-cache` | Inspect or clear the local cache | `info`, `clear [results\|tools\|orders\|picks\|all]`, `--server`, `--forget-key` |
+| `food-cache` | Inspect or clear the local cache | `info`, `clear [results\|tools\|orders\|picks\|usage\|all]`, `--server`, `--forget-key` |
 | `blinkit-mcp` | The Blinkit MCP server on its own (stdio) | for use in other MCP clients |
 
 `--app` accepts `all`, `zomato`, `swiggy`, `swiggy-food`, `swiggy-instamart`,
@@ -576,7 +727,7 @@ each service's app.
 
 ```bash
 uv sync
-uv run pytest -q          # 70 tests; no accounts or network needed (fake MCP servers)
+uv run pytest -q          # 96 tests; no accounts or network needed (fake MCP servers)
 ```
 
 ### Project layout
@@ -584,12 +735,15 @@ uv run pytest -q          # 70 tests; no accounts or network needed (fake MCP se
 ```
 src/food_console/
   __init__.py        terminal apps (zomato-chat, swiggy-chat, ...; chat / ask / pick / tools)
-  agent.py           Claude tool-use loop, system prompt, approval gate
+  agent.py           Claude tool-use loop, system prompt, approval gate, per-run usage
   mcp_bridge.py      providers, MCP sessions, schema normalisation, caching, reconnects
   auth.py            food-auth: login / logout / status
   store.py           encrypted SQLite cache (food-cache)
   stats.py           order-history extraction schema and all Stats metrics
   nutrition.py       dish picker: candidate schema, listed-nutrition parser, checks, ranking
+  payments.py        payment cards: UPI QR from payment requests, QR images, payment links
+  usage.py           token accounting per run: totals, cost at list prices, per-day, per-activity, per-model
+  router.py          model routing: task routes, Haiku classifier, in-conversation ratchet
   web.py             web UI server (food-ui)
   static/index.html  web UI (single file, no external resources)
   blinkit/           unofficial Blinkit MCP server: parsers, encrypted session, Playwright driver
@@ -614,7 +768,9 @@ mcp_config.json      MCP server definitions
 - Nutrition figures are platform data or estimates; the health score is a rough guide
   based on item names. Neither is medical advice.
 - Claude API usage is billed to your Anthropic account; Stats refreshes and long chats use
-  the most tokens.
+  the most tokens. Every request re-sends the tool definitions of all connected services
+  (about 63K tokens with all seven), mostly from the prompt cache; connect fewer services
+  with `--server` to send less.
 
 ## Credits and licence
 
